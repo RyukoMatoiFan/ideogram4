@@ -78,7 +78,7 @@ well ahead of the next-best open model:
 
 ### ContraLabs
 
-[ContraLabs](https://contralabs.ai/) ran a blind typography evaluation judged by
+[ContraLabs](https://contralabs.com/research) ran a blind typography evaluation judged by
 ten professional designers from Contra's top-earning talent. Ideogram 4 leads on
 first-place win rate, picked as the best of four models 47.9% of the time
 overall — well ahead of Gemini 3.1 Flash Image Preview (Nano Banana 2) at 30.0%,
