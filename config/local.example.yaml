@@ -1,0 +1,12 @@
+# copy to config/local.yaml (gitignored), fill machine paths
+#
+# config/local.yaml is deep-merged on top of any preset and holds the real,
+# machine-specific paths for your box. It is never committed.
+paths:
+  weights: /path/to/ideogram-4-fp8   # local weights dir OR an HF repo id
+  data_root: /path/to/datasets/hq-edit-10k
+  output_dir: /path/to/runs
+
+runtime:
+  hf_offline: false
+  extra_sys_path: []   # e.g. ["/path/to/checkout"] prepended to sys.path

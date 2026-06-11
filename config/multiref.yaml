@@ -1,0 +1,38 @@
+# Reference-driven / multi-reference editing: N reference images -> one composite per
+# instruction. References sit on separate MRoPE frames (t=1..N); the target denoises at
+# t=0. Encoder-free from caches written by precache_multiref.py (each row lists ref
+# image paths + a target + an instruction). Set real paths in config/local.yaml or IG4_*.
+#   python precache_multiref.py --config config/multiref.yaml
+#   python train_multiref.py     --config config/multiref.yaml
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/multiref-dataset
+  cache_dir: data/multiref-dataset/cache/train
+  output_dir: runs/multiref-lora
+
+lora:
+  rank: 256
+
+data:
+  resolution: 512
+  img_ext: jpg
+  instr_field: instruction
+  n_eval_holdout: 8
+
+optim:
+  lr: 1.0e-4
+  steps: 24000
+  batch: 1                   # variable ref-count per sample -> batch 1
+  accum: 4
+  warmup: 300
+  optimizer: adamw
+  grad_checkpointing: true
+  cfg_dropout_prob: 0.1
+  lr_scheduler: cosine
+  min_lr_ratio: 0.05
+
+logging:
+  log_every: 50
+  ckpt_every: 4000
+  sample_every: 4000
+  sample_guidance: 2.0

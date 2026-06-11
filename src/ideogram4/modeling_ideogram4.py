@@ -6,18 +6,47 @@ produce velocity predictions on image latents.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from ideogram4.constants import (
   LLM_TOKEN_INDICATOR,
   OUTPUT_IMAGE_INDICATOR,
+  REFERENCE_IMAGE_INDICATOR,
   QWEN3_VL_ACTIVATION_LAYERS,
 )
+
+# FlashAttention-2 / memory-efficient SDPA backend selection. The attention here
+# runs through F.scaled_dot_product_attention; PyTorch picks FlashAttention-2 when
+# no explicit mask is passed (we drop the block-diagonal segment mask whenever it
+# is trivial -- see Ideogram4Transformer._build_attn_mask). attention_backend lets
+# the caller force a preference order; "auto" keeps PyTorch's own choice.
+try:
+  from torch.nn.attention import sdpa_kernel, SDPBackend
+
+  _SDPA_BACKENDS = {
+    "flash": [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+    "efficient": [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+    "math": [SDPBackend.MATH],
+  }
+except Exception:  # pragma: no cover - older torch without torch.nn.attention
+  sdpa_kernel = None
+  _SDPA_BACKENDS = {}
+
+
+def _attention_context(backend: str):
+  """Context manager selecting the SDPA backend preference (no-op for 'auto')."""
+  order = _SDPA_BACKENDS.get(backend)
+  if sdpa_kernel is None or order is None:
+    return contextlib.nullcontext()
+  return sdpa_kernel(order)
 
 
 @dataclass
@@ -39,6 +68,11 @@ class Ideogram4Config:
   mrope_section: tuple[int, ...] = (24, 20, 20)
 
   norm_eps: float = 1e-5
+
+  # SDPA backend preference: "auto" lets PyTorch choose (it selects FlashAttention-2
+  # when the segment mask is dropped, i.e. any single-segment batch -- always true at
+  # batch size 1). "flash"/"efficient"/"math" force a preference order with fallback.
+  attention_backend: str = "auto"
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -130,7 +164,7 @@ class Ideogram4Attention(nn.Module):
   def forward(
     self,
     x: torch.Tensor,
-    segment_ids: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
   ) -> torch.Tensor:
@@ -150,9 +184,8 @@ class Ideogram4Attention(nn.Module):
 
     q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
-    # Block-diagonal mask from segment ids: (B, 1, L, L), True = attend.
-    attn_mask = (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(1)
-
+    # attn_mask is the precomputed (B, 1, L, L) block-diagonal mask, or None when it
+    # is trivially all-True (single segment) so SDPA can use FlashAttention-2.
     out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
     out = out.transpose(1, 2).reshape(batch_size, seq_len, self.hidden_size)
     return self.o(out)
@@ -192,7 +225,7 @@ class Ideogram4TransformerBlock(nn.Module):
   def forward(
     self,
     x: torch.Tensor,
-    segment_ids: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
     cos: torch.Tensor,
     sin: torch.Tensor,
     adaln_input: torch.Tensor,
@@ -206,7 +239,7 @@ class Ideogram4TransformerBlock(nn.Module):
 
     attn_out = self.attention(
       self.attention_norm1(x) * scale_msa,
-      segment_ids=segment_ids,
+      attn_mask=attn_mask,
       cos=cos,
       sin=sin,
     )
@@ -268,6 +301,11 @@ class Ideogram4Transformer(nn.Module):
   def __init__(self, config: Ideogram4Config) -> None:
     super().__init__()
     self.config = config
+    # Opt-in activation checkpointing: recompute each block in backward instead of
+    # storing its activations. Cuts training activation memory ~linearly in depth
+    # (the dominant term), at ~1.2-1.3x compute -- the enabler for higher batch /
+    # resolution / LoRA rank. No effect at inference (only active under .training).
+    self.gradient_checkpointing = False
 
     head_dim = config.emb_dim // config.num_heads
 
@@ -308,6 +346,18 @@ class Ideogram4Transformer(nn.Module):
   def device(self) -> torch.device:
     return next(self.parameters()).device
 
+  def _build_attn_mask(self, segment_ids: torch.Tensor) -> Optional[torch.Tensor]:
+    """Block-diagonal attention mask from segment ids, or None when trivial.
+
+    When every token shares a segment id (always true at batch size 1, and for any
+    fully-visible sequence) the mask is all-True, so we return None and let SDPA
+    dispatch to FlashAttention-2 (which rejects explicit masks). Computed once per
+    forward here instead of redundantly inside all 34 attention layers.
+    """
+    if bool((segment_ids == segment_ids[:, :1]).all()):
+      return None
+    return (segment_ids.unsqueeze(2) == segment_ids.unsqueeze(1)).unsqueeze(1)
+
   def forward(
     self,
     *,
@@ -344,12 +394,17 @@ class Ideogram4Transformer(nn.Module):
 
     indicator = indicator.to(torch.long)
     llm_token_mask = (indicator == LLM_TOKEN_INDICATOR).to(x.dtype).unsqueeze(-1)
-    output_image_mask = (indicator == OUTPUT_IMAGE_INDICATOR).to(x.dtype).unsqueeze(-1)
+    # Both the noised target latents and any clean reference-image latents are real
+    # image content and must pass through input_proj. At plain text-to-image inference
+    # no REFERENCE_IMAGE_INDICATOR tokens exist, so this reduces to the original mask.
+    image_latent_mask = (
+      (indicator == OUTPUT_IMAGE_INDICATOR) | (indicator == REFERENCE_IMAGE_INDICATOR)
+    ).to(x.dtype).unsqueeze(-1)
 
     llm_features = llm_features * llm_token_mask
-    x = x * output_image_mask
+    x = x * image_latent_mask
 
-    x = self.input_proj(x) * output_image_mask
+    x = self.input_proj(x) * image_latent_mask
 
     # Keep shape (B, 1, ...) when t is per-sample so downstream adaln_modulation
     # projections don't pay for L identical copies.
@@ -363,17 +418,40 @@ class Ideogram4Transformer(nn.Module):
 
     h = x + llm_features
 
-    image_indicator_embedding = self.embed_image_indicator(
-      (indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long)
-    )
+    # Mark image-latent tokens with the "image" embedding. With the pretrained
+    # nn.Embedding(2), target and reference share the "image" slot (1) and are told
+    # apart only by their MRoPE frame index. If the embedding has been expanded to 3
+    # rows (see train_edit.expand_reference_embedding, for full-rank finetuning),
+    # reference tokens get their own slot (2). Both layouts are supported so stock
+    # checkpoints keep loading unchanged.
+    if self.embed_image_indicator.num_embeddings >= 3:
+      idx = torch.zeros_like(indicator)
+      idx = torch.where(indicator == OUTPUT_IMAGE_INDICATOR, torch.ones_like(idx), idx)
+      idx = torch.where(
+        indicator == REFERENCE_IMAGE_INDICATOR, torch.full_like(idx, 2), idx
+      )
+      image_indicator_embedding = self.embed_image_indicator(idx)
+    else:
+      image_indicator_embedding = self.embed_image_indicator(
+        (image_latent_mask.squeeze(-1) > 0).to(torch.long)
+      )
     h = h + image_indicator_embedding
 
     cos, sin = self.rotary_emb(position_ids)
     cos = cos.to(h.dtype)
     sin = sin.to(h.dtype)
 
-    for layer in self.layers:
-      h = layer(h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input)
+    # Compute the attention mask once (was rebuilt in every layer); None => flash.
+    attn_mask = self._build_attn_mask(segment_ids)
+
+    with _attention_context(self.config.attention_backend):
+      for layer in self.layers:
+        if self.gradient_checkpointing and self.training:
+          h = torch.utils.checkpoint.checkpoint(
+            layer, h, attn_mask, cos, sin, adaln_input, use_reentrant=False
+          )
+        else:
+          h = layer(h, attn_mask=attn_mask, cos=cos, sin=sin, adaln_input=adaln_input)
 
     out = self.final_layer(h, c=adaln_input)
     return out.to(torch.float32)

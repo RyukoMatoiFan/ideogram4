@@ -1,0 +1,45 @@
+# Track C -- a Concept-Slider LoRA: a bidirectional attribute knob (e.g. a "detailer").
+# No paired targets: slider_training_step regresses the +/- adapter onto the FROZEN
+# base's own prediction, nudged along (positive_prompt - negative_prompt) in velocity
+# space. At inference, dial strength with lora.lora_scaled(transformer, infer_scale)
+# (factor>0 enhances, <0 inverts) and run sample_edit_cached; or use prompt-defined
+# guidance via edit_sampler.sample_edit_sliders without training at all.
+# Train on a folder of context images (data_root); rank can be small -- a slider is a
+# coarse direction, not a task. Run: python train_slider.py --config config/slider.yaml
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/slider-context        # any image set the slider should act on
+  output_dir: runs/slider-detail
+
+lora:
+  rank: 32
+
+data:
+  resolution: 512
+
+optim:
+  lr: 1.0e-4
+  steps: 1500
+  batch: 1
+  accum: 4
+  warmup: 50
+  optimizer: adamw
+  grad_checkpointing: true   # two training graphs (+/- passes) at 512px need this
+
+flow:
+  timestep_shift: 1.0
+  timestep_weighting: uniform
+
+slider:
+  positive_prompt: "highly detailed, sharp, intricate texture, fine details"
+  negative_prompt: "blurry, smooth, low detail, soft, out of focus"
+  anchor_prompt: ""           # "" -> unconditional anchor (slider composes on any prompt)
+  eta: 2.0                    # direction strength defining the train targets
+  train_scale: 1.0            # +/- adapter scale during training
+  bidirectional: true         # true: ± knob; false: enhance-only (+scale only)
+  infer_scale: 2.0            # default strength at inference
+  late_step_frac: 0.4         # apply only in the final 40% of steps (detail tail)
+
+logging:
+  log_every: 25
+  ckpt_every: 500

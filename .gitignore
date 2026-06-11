@@ -161,9 +161,22 @@ cython_debug/
 # Claude Code local settings
 .claude/
 
-# Generated sample outputs
-out.png
-output.png
+# Training: machine-specific config, state logs, run outputs, weights, caches.
+# All experiment scaffolding, dev tooling, and generated demo outputs live in the
+# gitignored private/ folder (kept out of the fork) -- so this stays short.
+private/
+config/local.yaml
+STATE.md
+STATE_ARCHIVE.md
+PLAN.md
+runs/
+ckpts*/
+*.safetensors
+*.log
+data/
+*.pt
+__pycache__/
+*.pyc
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

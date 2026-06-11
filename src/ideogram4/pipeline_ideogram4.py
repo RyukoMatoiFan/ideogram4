@@ -81,7 +81,19 @@ def _load_fp8_text_encoder(
   config = AutoConfig.from_pretrained(
     repo_id, subfolder=text_encoder_subfolder, trust_remote_code=True
   )
-  model = AutoModel.from_config(config, trust_remote_code=True)
+  # Skip the (very slow) random init of all ~8B Linear/Embedding weights: every
+  # quantized Linear is replaced by an Fp8Linear below and every surviving param
+  # is overwritten from the checkpoint, so the default kaiming/normal init is pure
+  # wasted CPU (it dominated the ~330s load). no_init_weights only no-ops the
+  # weight init -- module __init__ still runs, so computed non-persistent buffers
+  # (rotary caches) are preserved exactly as before.
+  try:
+    from transformers.modeling_utils import no_init_weights
+
+    with no_init_weights():
+      model = AutoModel.from_config(config, trust_remote_code=True)
+  except Exception:  # pragma: no cover - older/newer transformers without the ctx
+    model = AutoModel.from_config(config, trust_remote_code=True)
   state_dict = _load_subfolder_state_dict(repo_id, text_encoder_subfolder, "model")
   swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
   # assign=True so unquantized params take the loaded dtype and the computed

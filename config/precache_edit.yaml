@@ -1,0 +1,15 @@
+# Precompute VAE latents + text-encoder features for an instruction-edit dataset.
+# Layout: <data_root>/train/meta.jsonl with NNNNNN_src.<ext> / NNNNNN_tgt.<ext>, each
+# meta row {"idx": N, "<instr_field>": "edit instruction"}. Training then runs
+# encoder-free from the .pt caches. Set real paths in config/local.yaml or via IG4_*.
+# Run: python precache_edit.py --config config/precache_edit.yaml
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/edit-dataset
+
+data:
+  resolution: 512
+  img_ext: png
+  instr_field: edit
+  meta_at_root: false
+  limit: 0

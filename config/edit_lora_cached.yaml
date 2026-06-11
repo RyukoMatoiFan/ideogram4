@@ -1,0 +1,30 @@
+# Encoder-free instruction-edit LoRA training from precomputed .pt caches.
+# Run precache_edit.py first, then:
+#   python train_edit_lora_cached.py --config config/edit_lora_cached.yaml
+# Set real paths in config/local.yaml or via IG4_*; bump rank/steps with IG4_LORA__RANK etc.
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/edit-dataset
+  cache_dir: data/edit-dataset/cache/train
+  output_dir: runs/edit-lora-cached
+
+lora:
+  rank: 128
+
+data:
+  resolution: 512
+  n_eval_holdout: 4
+
+optim:
+  lr: 1.0e-4
+  steps: 3000
+  batch: 1
+  accum: 4
+  warmup: 100
+  optimizer: adamw
+  grad_checkpointing: false
+  cfg_dropout_prob: 0.1
+
+logging:
+  log_every: 25
+  ckpt_every: 1000

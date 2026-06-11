@@ -1,0 +1,26 @@
+# Instruction-edit LoRA via the full pipeline (no precache; loads text encoder + VAE).
+# Slower to start but self-contained. For scale, prefer precache + edit_lora_cached.yaml.
+# Run: python train_edit_lora.py --config config/edit_lora.yaml
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/edit-dataset
+  output_dir: runs/edit-lora
+
+lora:
+  rank: 128
+
+data:
+  resolution: 512
+  n_eval_holdout: 4
+
+optim:
+  lr: 1.0e-4
+  steps: 3000
+  batch: 1
+  accum: 4
+  warmup: 100
+  cfg_dropout_prob: 0.1
+
+logging:
+  log_every: 25
+  ckpt_every: 1000
