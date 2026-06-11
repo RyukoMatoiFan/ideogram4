@@ -50,6 +50,32 @@ from ideogram4.scheduler import LogitNormalSchedule, get_schedule_for_resolution
 REFERENCE_POSITION_T = 1
 
 
+def load_encoders_pipeline(weights_repo: str, device, dtype) -> Ideogram4Pipeline:
+  """Load an encoders-ONLY pipeline (text encoder + VAE, transformers=None).
+
+  Encoding images/captions for precache/precompute needs only the VAE + text encoder,
+  NOT the two 9.3B transformers -- loading the full pipeline there peaks ~27GB for
+  nothing. This keeps the encode phase well under 24GB (~11GB). The returned object
+  supports ``encode_image_tokens``, ``build_edit_inputs``, and ``_encode_text``; do not
+  call its transformer paths (they are None).
+  """
+  from ideogram4.pipeline_ideogram4 import (
+    Ideogram4PipelineConfig, _load_qwen3_vl, _load_autoencoder,
+  )
+  from ideogram4 import pipeline_ideogram4 as _pm  # for the runtime-patched hf_hub_download
+
+  pcfg = Ideogram4PipelineConfig(weights_repo=weights_repo)
+  tok, text_encoder = _load_qwen3_vl(
+    pcfg.weights_repo, device, dtype,
+    tokenizer_subfolder=pcfg.tokenizer_subfolder, text_encoder_subfolder=pcfg.text_encoder_subfolder)
+  ae = _load_autoencoder(
+    _pm.hf_hub_download(repo_id=pcfg.weights_repo, filename=pcfg.autoencoder_filename), device, dtype)
+  return Ideogram4Pipeline(
+    conditional_transformer=None, unconditional_transformer=None,
+    text_encoder=text_encoder, text_tokenizer=tok, autoencoder=ae,
+    config=pcfg, device=device, dtype=dtype)
+
+
 # --------------------------------------------------------------------------- #
 # Latent encoding (inverse of Ideogram4Pipeline._decode)
 # --------------------------------------------------------------------------- #
@@ -529,9 +555,17 @@ def slider_training_step(
   eta: float = 2.0,
   slider_scale: float = 1.0,
   bidirectional: bool = True,
+  context: str = "edit",
   generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
   """One disentangled Concept-Slider step in flow-matching *velocity* space.
+
+  ``context`` picks the sequence layout, which MUST match how the slider is used at
+  inference: ``"t2i"`` = plain ``[text][target]`` (a slider for text-to-image
+  generation -- ``z_ctx`` only seeds the noised target, no reference frame); ``"edit"``
+  = ``[text][reference][target]`` (a slider for the in-context editor). Training in the
+  wrong context is why a t2i-applied slider trained with a reference frame barely
+  transfers.
 
   Trains a slider LoRA so that scaling its adapter by ``+slider_scale`` shifts the
   model's velocity prediction toward an attribute (``llm_pos``) and ``-slider_scale``
@@ -566,7 +600,11 @@ def slider_training_step(
   llm_dim = llm_pos.shape[-1]
   latent_dim = z_ctx.shape[-1]
 
-  meta = build_edit_sequence_meta(num_text, grid_h, grid_w, device)
+  if context == "t2i":
+    from ideogram4.train_t2i import build_t2i_sequence_meta
+    meta = build_t2i_sequence_meta(num_text, grid_h, grid_w, device)
+  else:
+    meta = build_edit_sequence_meta(num_text, grid_h, grid_w, device)
   indicator = meta["indicator"]
   seq_len = indicator.shape[1]
   ref_mask = indicator == REFERENCE_IMAGE_INDICATOR
@@ -587,7 +625,8 @@ def slider_training_step(
   t_b = t.view(1, 1, 1)
   x_t = t_b * z0 + (1.0 - t_b) * noise
   x = torch.zeros(1, seq_len, latent_dim, device=device, dtype=torch.float32)
-  x[ref_mask] = z_ctx.view(n, latent_dim).to(torch.float32)
+  if ref_mask.any():  # "edit" context: a clean reference frame; "t2i" has none
+    x[ref_mask] = z_ctx.view(n, latent_dim).to(torch.float32)
   x[tgt_mask] = x_t.reshape(n, latent_dim)
 
   def vel(llm: torch.Tensor) -> torch.Tensor:

@@ -100,6 +100,70 @@ def sample_edit_cached(
 
 
 @torch.no_grad()
+def sample_t2i(
+  transformer: torch.nn.Module,
+  llm_text: torch.Tensor,
+  grid_h: int,
+  grid_w: int,
+  *,
+  schedule: LogitNormalSchedule,
+  num_steps: int = 20,
+  guidance_scale: float = 3.0,
+  generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+  """Encoder-free plain text-to-image generation from CACHED text features.
+
+  In-training preview counterpart to ``train_t2i.t2i_training_step``: packs
+  ``[text][target]`` (no reference frame) and denoises the target with a flow-matching
+  Euler loop using instruction-CFG (negative branch zeroes the text) on the conditional
+  transformer. Returns the target latent ``(1, n, 128)`` -- decode with ``decode_latents``.
+  This is a monitoring preview; final quality uses the full pipeline with both
+  transformers + a sampler preset.
+  """
+  from ideogram4.train_t2i import build_t2i_sequence_meta
+
+  device = llm_text.device
+  n = grid_h * grid_w
+  num_text = llm_text.shape[0]
+  llm_dim = llm_text.shape[-1]
+
+  meta = build_t2i_sequence_meta(num_text, grid_h, grid_w, device)
+  indicator = meta["indicator"]
+  seq_len = indicator.shape[1]
+  tgt_mask = indicator == OUTPUT_IMAGE_INDICATOR
+
+  # latent dim from the transformer's input projection width is 128 for ig4.
+  latent_dim = 128
+  llm_pos = torch.zeros(1, seq_len, llm_dim, device=device, dtype=torch.float32)
+  llm_pos[0, :num_text] = llm_text.to(torch.float32)
+  llm_neg = torch.zeros_like(llm_pos)
+  do_cfg = guidance_scale != 1.0
+
+  step_intervals = make_step_intervals(num_steps).to(device)
+  z = torch.randn(1, n, latent_dim, device=device, dtype=torch.float32, generator=generator)
+
+  for i in range(num_steps - 1, -1, -1):
+    t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
+    s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
+    t = torch.full((1,), t_val, dtype=torch.float32, device=device)
+    x = torch.zeros(1, seq_len, latent_dim, device=device, dtype=torch.float32)
+    x[tgt_mask] = z.reshape(n, latent_dim)
+
+    def vel(llm):
+      out = transformer(llm_features=llm, x=x, t=t, position_ids=meta["position_ids"],
+                        segment_ids=meta["segment_ids"], indicator=indicator)
+      return out[tgt_mask].reshape(1, n, latent_dim)
+
+    v = vel(llm_pos)
+    if do_cfg:
+      vn = vel(llm_neg)
+      v = vn + guidance_scale * (v - vn)
+    z = z + v * (s_val - t_val)
+
+  return z
+
+
+@torch.no_grad()
 def sample_multiref(
   transformer: torch.nn.Module,
   z_refs: list[torch.Tensor],

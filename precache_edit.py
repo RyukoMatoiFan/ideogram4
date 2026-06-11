@@ -56,11 +56,10 @@ def main():
   limit = int(cfg.data.limit)
 
   t0 = time.time()
-  pipe = Ideogram4Pipeline.from_pretrained(
-    config=Ideogram4PipelineConfig(weights_repo=cfg.paths.weights),
-    device=cfg.runtime.device, dtype=dtype_of(cfg),
-  )
-  print(f"[precache] pipeline loaded in {time.time()-t0:.1f}s", flush=True)
+  # Encoders-only pipeline (text encoder + VAE, NO transformers): precache only encodes,
+  # so this keeps VRAM ~11GB instead of ~27GB (<=24GB portable).
+  pipe = train_edit.load_encoders_pipeline(cfg.paths.weights, cfg.runtime.device, dtype_of(cfg))
+  print(f"[precache] encoders loaded in {time.time()-t0:.1f}s (no transformers)", flush=True)
 
   patch = pipe.config.patch_size * pipe.config.ae_scale_factor
   grid = res // patch

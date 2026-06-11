@@ -22,12 +22,18 @@ import time
 import torch
 from PIL import Image
 
-from ideogram4.pipeline_ideogram4 import Ideogram4Pipeline, Ideogram4PipelineConfig
+from ideogram4.pipeline_ideogram4 import (
+  Ideogram4Pipeline, Ideogram4PipelineConfig,
+  _build_transformer, _load_indexed_or_single_state_dict,
+)
+from ideogram4.modeling_ideogram4 import Ideogram4Config
 from ideogram4.constants import LLM_TOKEN_INDICATOR
 from ideogram4.scheduler import get_schedule_for_resolution
 from ideogram4 import train_edit
 from ideogram4 import lora as loramod
 from ideogram4.training_utils import build_optimizer, build_lr_scheduler, is_finite_loss
+
+_LATENT_DIM = 128  # ig4 patch-latent width
 
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -67,6 +73,9 @@ def main():
   ap.add_argument("--rollout", type=int, default=0,
                   help="If >0, generate this many context images from the base model "
                        "(zero external data) instead of reading paths.data_root.")
+  ap.add_argument("--noise", action="store_true",
+                  help="Image-free mode: probe x_t at random latents (no rollout, no "
+                       "folder, no VAE). Only the text encoder is loaded -> stays <=24GB.")
   args = ap.parse_args()
 
   from ideogram4.training_config import load_config, apply_runtime, dtype_of
@@ -87,75 +96,98 @@ def main():
   metrics_path = os.path.join(output_dir, "metrics.jsonl")
   open(metrics_path, "w").close()
 
-  t0 = time.time()
-  pipe = Ideogram4Pipeline.from_pretrained(
-    config=Ideogram4PipelineConfig(weights_repo=cfg.paths.weights),
-    device=cfg.runtime.device, dtype=dtype)
-  patch = pipe.config.patch_size * pipe.config.ae_scale_factor
-  ps = pipe.config.patch_size
+  import gc
+  pcfg = Ideogram4PipelineConfig(weights_repo=cfg.paths.weights)
+  patch = pcfg.patch_size * pcfg.ae_scale_factor
+  ps = pcfg.patch_size
   grid = res // patch
-  print(f"[slider] pipeline loaded in {time.time()-t0:.1f}s | grid {grid}x{grid}", flush=True)
+  noise_mode = bool(args.noise)
+  needs_gen = (not noise_mode) and (args.rollout > 0)  # only rollout has to GENERATE
 
-  # --- one-time conditioning: encode the +/- (and anchor) prompts to padded rows ---
-  rows_pos = _encode_prompt_rows(pipe, s.positive_prompt, grid)
-  rows_neg = _encode_prompt_rows(pipe, s.negative_prompt, grid)
-  rows_anc = _encode_prompt_rows(pipe, s.anchor_prompt, grid) if s.anchor_prompt else None
+  # --- Phase 1: load the encoder(s) to encode prompts (+ context). Only --rollout needs
+  # the full pipeline (it generates); noise/folder load encoders-only and stay <=24GB. ---
+  t0 = time.time()
+  if needs_gen:
+    enc_pipe = Ideogram4Pipeline.from_pretrained(
+      config=pcfg, device=cfg.runtime.device, dtype=dtype)
+    print(f"[slider] full pipeline loaded in {time.time()-t0:.1f}s | grid {grid}x{grid}", flush=True)
+  else:
+    enc_pipe = train_edit.load_encoders_pipeline(cfg.paths.weights, device, dtype)
+    print(f"[slider] encoders loaded in {time.time()-t0:.1f}s "
+          f"({'image-free noise' if noise_mode else 'folder'} mode, <=24GB) | grid {grid}x{grid}", flush=True)
+
+  # --- encode the +/- (and anchor) prompts to padded rows ---
+  rows_pos = _encode_prompt_rows(enc_pipe, s.positive_prompt, grid)
+  rows_neg = _encode_prompt_rows(enc_pipe, s.negative_prompt, grid)
+  rows_anc = _encode_prompt_rows(enc_pipe, s.anchor_prompt, grid) if s.anchor_prompt else None
   llm_dim = rows_pos.shape[-1]
   num_text = max(rows_pos.shape[0], rows_neg.shape[0],
                  rows_anc.shape[0] if rows_anc is not None else 0)
   llm_pos = _pad_rows(rows_pos, num_text, llm_dim, device)
   llm_neg = _pad_rows(rows_neg, num_text, llm_dim, device)
   llm_anchor = _pad_rows(rows_anc, num_text, llm_dim, device) if rows_anc is not None else None
+  ctx_name = "noise" if noise_mode else ("rollout" if needs_gen else "folder")
   print(f"[slider] axis: (+)'{s.positive_prompt[:40]}' (-)'{s.negative_prompt[:40]}' "
-        f"| num_text={num_text} eta={s.eta} train_scale={s.train_scale}", flush=True)
+        f"| num_text={num_text} eta={s.eta} ctx={ctx_name}", flush=True)
 
-  # --- one-time: gather context images the slider acts on (rollouts or a folder) ---
-  z_ctxs = []
-  if args.rollout > 0:
-    with torch.no_grad():
-      for k in range(args.rollout):
-        prompt = _ROLLOUT_PROMPTS[k % len(_ROLLOUT_PROMPTS)]
-        img = pipe([prompt], height=res, width=res, num_steps=24, guidance_scale=5.0,
-                   seed=1000 + k, raise_on_caption_issues=False)[0]
-        ten = train_edit.images_to_tensor([img], res, res, pipe.device)
-        z_ctxs.append(train_edit.encode_image_tokens(pipe, ten, patch_size=ps)[0]
-                      .to(torch.float32).cpu())
-        if (k + 1) % 8 == 0:
-          print(f"[slider] rollout {k+1}/{args.rollout}", flush=True)
-    print(f"[slider] generated {len(z_ctxs)} rollout context images (zero external data)", flush=True)
+  # Pre-encode a few generation prompts for in-training previews (text encoder still loaded).
+  sample_every = int(cfg.logging.sample_every)
+  sample_llm = []
+  if sample_every:
+    for k in range(min(int(cfg.logging.sample_count), len(_ROLLOUT_PROMPTS))):
+      sample_llm.append(_encode_prompt_rows(enc_pipe, _ROLLOUT_PROMPTS[k], grid).to(torch.float32).cpu())
+    print(f"[slider] pre-encoded {len(sample_llm)} preview prompts", flush=True)
+
+  # --- gather context latents (None for image-free noise mode; x_t is random there) ---
+  z_ctxs = None
+  if not noise_mode:
+    z_ctxs = []
+    if args.rollout > 0:
+      with torch.no_grad():
+        for k in range(args.rollout):
+          img = enc_pipe([_ROLLOUT_PROMPTS[k % len(_ROLLOUT_PROMPTS)]], height=res, width=res,
+                         num_steps=24, guidance_scale=5.0, seed=1000 + k, raise_on_caption_issues=False)[0]
+          ten = train_edit.images_to_tensor([img], res, res, device)
+          z_ctxs.append(train_edit.encode_image_tokens(enc_pipe, ten, patch_size=ps)[0].to(torch.float32).cpu())
+          if (k + 1) % 8 == 0:
+            print(f"[slider] rollout {k+1}/{args.rollout}", flush=True)
+      print(f"[slider] generated {len(z_ctxs)} rollout context images", flush=True)
+    else:
+      paths = []
+      for root, _, fnames in os.walk(cfg.paths.data_root):
+        for fn in fnames:
+          if fn.lower().endswith(_IMG_EXTS):
+            paths.append(os.path.join(root, fn))
+      paths.sort()
+      if not paths:
+        raise FileNotFoundError(
+          f"no context images under paths.data_root={cfg.paths.data_root!r}; "
+          "use --rollout N (self-generate) or --noise (image-free)")
+      with torch.no_grad():
+        for p in paths:
+          ten = train_edit.images_to_tensor([Image.open(p).convert("RGB")], res, res, device)
+          z_ctxs.append(train_edit.encode_image_tokens(enc_pipe, ten, patch_size=ps)[0].to(torch.float32).cpu())
+      print(f"[slider] encoded {len(z_ctxs)} context images from {cfg.paths.data_root}", flush=True)
+
+  # --- obtain the conditional transformer, free the rest ---
+  if needs_gen:
+    transformer = enc_pipe.conditional_transformer
+    enc_pipe.unconditional_transformer = None
+    enc_pipe.text_encoder = None
+    enc_pipe.text_tokenizer = None
+    enc_pipe.autoencoder = None
   else:
-    data_root = cfg.paths.data_root
-    paths = []
-    for root, _, fnames in os.walk(data_root):
-      for fn in fnames:
-        if fn.lower().endswith(_IMG_EXTS):
-          paths.append(os.path.join(root, fn))
-    paths.sort()
-    if not paths:
-      raise FileNotFoundError(
-        f"no context images ({_IMG_EXTS}) under paths.data_root={data_root!r}; "
-        "point it at a folder of images, or pass --rollout N to self-generate context")
-    with torch.no_grad():
-      for p in paths:
-        img = Image.open(p).convert("RGB")
-        ten = train_edit.images_to_tensor([img], res, res, pipe.device)
-        z_ctxs.append(train_edit.encode_image_tokens(pipe, ten, patch_size=ps)[0]
-                      .to(torch.float32).cpu())
-    print(f"[slider] encoded {len(z_ctxs)} context images from {data_root}", flush=True)
-
-  # --- free everything the slider does NOT train (it uses only the conditional
-  # transformer now that prompts + context are encoded). The full pipeline + two
-  # training graphs would otherwise OOM at 512px. ---
-  import gc
-  transformer = pipe.conditional_transformer
-  pipe.unconditional_transformer = None
-  pipe.text_encoder = None
-  pipe.text_tokenizer = None
-  pipe.autoencoder = None
+    del enc_pipe
+    gc.collect()
+    if device.type == "cuda":
+      torch.cuda.empty_cache()
+    sd = _load_indexed_or_single_state_dict(pcfg.weights_repo, pcfg.conditional_index_filename)
+    transformer = _build_transformer(Ideogram4Config(), sd, device, dtype)
+    del sd
   gc.collect()
   if device.type == "cuda":
     torch.cuda.empty_cache()
-  print("[slider] freed text encoder / VAE / unconditional transformer", flush=True)
+  print("[slider] training the conditional transformer only", flush=True)
 
   # --- inject the slider adapter ---
   wrapped = loramod.inject_lora(transformer, rank=rank)
@@ -176,6 +208,7 @@ def main():
   if device.type == "cuda":
     torch.cuda.reset_peak_memory_stats()
   run, t_last = 0.0, time.time()
+  t_step_prev = t_last
   log_every = int(cfg.logging.log_every)
   ckpt_every = int(cfg.logging.ckpt_every)
 
@@ -184,15 +217,51 @@ def main():
             "step": step_num, "positive": s.positive_prompt, "negative": s.negative_prompt,
             "eta": s.eta, "train_scale": s.train_scale, "infer_scale": s.infer_scale}
 
+  sample_dir = os.path.join(output_dir, "samples")
+  decoder_state = {"d": None}
+
+  def _sample(step_num):
+    """Decode in-training previews [-s | off | +s] per prompt to samples/ (the slider knob)."""
+    from PIL import Image as PILImage
+    from ideogram4 import edit_sampler
+    from ideogram4.lora import lora_scaled
+    if decoder_state["d"] is None:
+      decoder_state["d"] = edit_sampler.load_decoder(cfg.paths.weights, device, dtype)
+    ae, shift, lscale, dpatch = decoder_state["d"]
+    os.makedirs(sample_dir, exist_ok=True)
+    sc = float(s.infer_scale)
+    transformer.eval()
+    rows = []
+    for llm in sample_llm:
+      panels = []
+      for factor in (-sc, 0.0, sc):
+        with lora_scaled(transformer, factor):
+          z = edit_sampler.sample_t2i(
+            transformer, llm.to(device), grid, grid, schedule=schedule,
+            num_steps=int(cfg.logging.sample_steps), guidance_scale=float(cfg.logging.sample_guidance),
+            generator=torch.Generator(device=device).manual_seed(step_num))
+        panels.append(edit_sampler.decode_latents(
+          ae, z, grid, grid, patch_size=dpatch, latent_shift=shift, latent_scale=lscale, dtype=dtype)[0])
+      rows.append(panels)
+    transformer.train()
+    w, h = rows[0][0].size
+    canvas = PILImage.new("RGB", (w * 3, h * len(rows)), (15, 15, 15))
+    for r, panels in enumerate(rows):
+      for c, im in enumerate(panels):
+        canvas.paste(im, (c * w, r * h))  # -s | off | +s
+    canvas.save(os.path.join(sample_dir, f"step{step_num:06d}.png"))
+    print(f"[slider] sampled {len(rows)} [-{sc}|off|+{sc}] @ step {step_num} -> {sample_dir}", flush=True)
+
   for step in range(steps):
     opt.zero_grad()
     acc = 0.0
     for _ in range(accum):
-      z_ctx = z_ctxs[rng.randrange(len(z_ctxs))].to(device)
+      z_ctx = (torch.randn(grid * grid, _LATENT_DIM, device=device, generator=gen)
+               if noise_mode else z_ctxs[rng.randrange(len(z_ctxs))].to(device))
       loss = train_edit.slider_training_step(
         transformer, z_ctx, llm_pos, llm_neg, grid, grid, schedule=schedule,
         llm_anchor=llm_anchor, eta=float(s.eta), slider_scale=float(s.train_scale),
-        bidirectional=bool(s.bidirectional), generator=gen)
+        bidirectional=bool(s.bidirectional), context=s.context, generator=gen)
       if cfg.optim.nan_guard and not is_finite_loss(loss):
         continue
       (loss / accum).backward()
@@ -201,20 +270,24 @@ def main():
     opt.step()
     sched_lr.step()
     run += acc
-    if (step + 1) % log_every == 0:
-      dt = (time.time() - t_last) / log_every
-      rec = {"step": step + 1, "loss": run / log_every, "lr": sched_lr.get_last_lr()[0],
-             "s_per_step": dt, "peak_gb": (torch.cuda.max_memory_allocated() / 1e9
-                                           if device.type == "cuda" else 0.0)}
-      print(f"[slider] step {step+1}/{steps} loss {rec['loss']:.4f} lr {rec['lr']:.2e} "
-            f"| {dt:.2f}s/step peak {rec['peak_gb']:.1f}GB", flush=True)
-      with open(metrics_path, "a") as mf:
-        mf.write(json.dumps(rec) + "\n")
-      run, t_last = 0.0, time.time()
+    now = time.time(); step_dt = now - t_step_prev; t_step_prev = now
+    pgb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
+    with open(metrics_path, "a") as mf:  # per-step metrics (dense for the dashboard)
+      mf.write(json.dumps({"step": step + 1, "loss": acc, "lr": sched_lr.get_last_lr()[0],
+                           "s_per_step": step_dt, "peak_gb": pgb, "total": steps}) + "\n")
+    if (step + 1) % log_every == 0:  # console print cadence (windowed average)
+      print(f"[slider] step {step+1}/{steps} loss {run/log_every:.4f} lr {sched_lr.get_last_lr()[0]:.2e} "
+            f"| {(now-t_last)/log_every:.2f}s/step peak {pgb:.1f}GB", flush=True)
+      run, t_last = 0.0, now
     if (step + 1) % ckpt_every == 0:
       loramod.save_lora(wrapped, f"{ckpt}/slider_rank{rank}_step{step+1}.safetensors",
                         metadata=_meta(step + 1))
       print(f"[slider] checkpoint @ step {step+1}", flush=True)
+    if sample_every and sample_llm and (step + 1) % sample_every == 0:
+      try:
+        _sample(step + 1)
+      except Exception as exc:  # previews must never crash training
+        print(f"[slider] sampling skipped @ step {step+1}: {exc}", flush=True)
 
   loramod.save_lora(wrapped, f"{ckpt}/slider_rank{rank}_final.safetensors", metadata=_meta(steps))
   print(f"[slider] DONE -> {ckpt}/slider_rank{rank}_final.safetensors", flush=True)

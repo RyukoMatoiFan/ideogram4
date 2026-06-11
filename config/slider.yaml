@@ -37,9 +37,14 @@ slider:
   eta: 2.0                    # direction strength defining the train targets
   train_scale: 1.0            # +/- adapter scale during training
   bidirectional: true         # true: ± knob; false: enhance-only (+scale only)
+  context: t2i                # train in the layout used at inference: t2i (T2I gen) | edit
   infer_scale: 2.0            # default strength at inference
   late_step_frac: 0.4         # apply only in the final 40% of steps (detail tail)
 
 logging:
   log_every: 25
   ckpt_every: 500
+  sample_every: 250      # 0 = off; decode [-s | off | +s] slider previews to <output_dir>/samples
+  sample_count: 2        # how many prompts to preview
+  sample_steps: 20
+  sample_guidance: 3.0

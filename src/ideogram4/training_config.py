@@ -119,6 +119,7 @@ class SliderConfig:
   eta: float = 2.0             # direction strength defining the train targets
   train_scale: float = 1.0     # +/- adapter scale the slider is trained at
   bidirectional: bool = True   # True: ± knob; False: enhance-only (+scale branch only)
+  context: str = "t2i"         # sequence layout to train in; MUST match inference: t2i | edit
   infer_scale: float = 2.0     # default slider strength at inference (lora_scaled factor)
   late_step_frac: float = 0.0  # restrict slider effect to the final fraction of sampler steps
 
@@ -137,9 +138,10 @@ class LoggingConfig:
   log_every: int = 25
   ckpt_every: int = 1000
   val_every: int = 0          # 0 = off; else held-out validation loss every N steps
-  sample_every: int = 0       # 0 = off; else decode held-out edit samples every N steps
+  sample_every: int = 0       # 0 = off; else decode in-training samples every N steps
   sample_steps: int = 20      # sampler steps for in-training samples
   sample_guidance: float = 2.0
+  sample_count: int = 4       # how many prompts/items to sample each time
 
 
 @dataclass
