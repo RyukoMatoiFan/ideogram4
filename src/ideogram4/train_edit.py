@@ -424,62 +424,6 @@ def build_multiref_sequence_meta(
   }
 
 
-def edit_training_step_cached(
-  transformer: nn.Module,
-  z_ref: torch.Tensor,
-  z_tgt: torch.Tensor,
-  llm_text: torch.Tensor,
-  grid_h: int,
-  grid_w: int,
-  *,
-  schedule: LogitNormalSchedule,
-  cfg_dropout_prob: float = 0.1,
-  generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
-  """One flow-matching step from precomputed tensors (no text encoder / VAE).
-
-  Args:
-    z_ref, z_tgt: (n, 128) normalized latent tokens for source/target (from
-      ``encode_image_tokens``), on the transformer's device.
-    llm_text: (num_text, llm_dim) the instruction's Qwen3-VL feature rows (the
-      LLM-indicator positions of ``_encode_text``'s output).
-  """
-  device = z_tgt.device
-  n = grid_h * grid_w
-  num_text = llm_text.shape[0]
-  latent_dim = z_tgt.shape[-1]
-  meta = build_edit_sequence_meta(num_text, grid_h, grid_w, device)
-  indicator = meta["indicator"]
-  seq_len = indicator.shape[1]
-
-  llm = torch.zeros(1, seq_len, llm_text.shape[-1], device=device, dtype=torch.float32)
-  drop = (
-    cfg_dropout_prob > 0.0
-    and torch.rand((), device=device, generator=generator).item() < cfg_dropout_prob
-  )
-  if not drop:
-    llm[0, :num_text] = llm_text.to(torch.float32)
-
-  z_tgt = z_tgt.view(1, n, latent_dim).to(torch.float32)
-  noise = torch.randn(1, n, latent_dim, device=device, dtype=torch.float32, generator=generator)
-  t = schedule(torch.rand((1,), device=device, generator=generator)).to(torch.float32)
-  t_b = t.view(1, 1, 1)
-  x_t = t_b * z_tgt + (1.0 - t_b) * noise
-  v_target = z_tgt - noise
-
-  ref_mask = indicator == REFERENCE_IMAGE_INDICATOR
-  tgt_mask = indicator == OUTPUT_IMAGE_INDICATOR
-  x = torch.zeros(1, seq_len, latent_dim, device=device, dtype=torch.float32)
-  x[ref_mask] = z_ref.view(n, latent_dim).to(torch.float32)
-  x[tgt_mask] = x_t.reshape(n, latent_dim)
-
-  pred = transformer(
-    llm_features=llm, x=x, t=t,
-    position_ids=meta["position_ids"], segment_ids=meta["segment_ids"], indicator=indicator,
-  )
-  return F.mse_loss(pred[tgt_mask].reshape(1, n, latent_dim), v_target)
-
-
 def edit_training_step_multiref(
   transformer: nn.Module,
   z_refs: list[torch.Tensor],
@@ -669,6 +613,7 @@ def edit_training_step_cached_batch(
   min_snr_gamma: float = 5.0,
   masked_loss: bool = False,
   mask_quantile: float = 0.5,
+  mask_bg_weight: float = 0.0,
   noise_offset: float = 0.0,
   input_perturbation: float = 0.0,
   prior_preservation_weight: float = 0.0,
@@ -772,7 +717,13 @@ def edit_training_step_cached_batch(
       [b["z_ref"].view(n, latent_dim) for b in batch]
     ).to(device, torch.float32)
 
-  loss_mask = derive_edit_mask(z_ref_stack, z_tgt, quantile=mask_quantile) if masked_loss else None
+  loss_mask = None
+  if masked_loss:
+    loss_mask = derive_edit_mask(z_ref_stack, z_tgt, quantile=mask_quantile)
+    if mask_bg_weight > 0.0:
+      # Soft mask: edited tokens weigh 1.0, background mask_bg_weight -- the model
+      # still learns copy/consistency, but sparse edits stop being gradient-drowned.
+      loss_mask = mask_bg_weight + (1.0 - mask_bg_weight) * loss_mask
   weight = None
   if timestep_weighting != "uniform":
     weight = timestep_weight(t, timestep_weighting, gamma=min_snr_gamma)
@@ -845,21 +796,6 @@ def dequantize_fp8_transformer(
     else:
       dequantize_fp8_transformer(child, dtype=dtype)
   return transformer
-
-
-def save_transformer(transformer: nn.Module, path: str) -> None:
-  """Save a full-rank finetuned transformer as safetensors in the stock key layout.
-
-  Keys match ``Ideogram4Transformer`` module names directly, so the result drops
-  into a weights dir as ``transformer/diffusion_pytorch_model.safetensors`` and
-  reloads through the normal ``Ideogram4Pipeline.from_pretrained`` path (the
-  non-quantized branch of ``_build_transformer`` does a strict ``load_state_dict``).
-  """
-  from safetensors.torch import save_file
-
-  state = {k: v.detach().to("cpu", torch.float32).contiguous()
-           for k, v in transformer.state_dict().items()}
-  save_file(state, path)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,51 @@
+# FULL fine-tune (not LoRA) of the edit transformer on a single 80GB GPU.
+# Dequantizes the published fp8 weights to bf16 and trains ALL transformer params via
+# fused-back-pass AdamW + stochastic rounding (~58GB peak for the 9.3B backbone).
+# Run precache_edit.py first, then:
+#   python train_edit_full_cached.py --config config/edit_full.yaml
+# Smoke first (verifies dequant + ~30 steps + VRAM, then exits): add --smoke
+# Set real paths in config/local.yaml or via IG4_* env overrides.
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/edit-dataset
+  cache_dir: data/edit-dataset/cache/train
+  output_dir: runs/edit-full
+  ckpt_dir: runs/edit-full/ckpts
+  resume_from: auto
+
+lora:
+  rank: 0                 # unused (full fine-tune)
+
+data:
+  resolution: 512
+  n_eval_holdout: 4
+  masked_loss: true       # concentrate the loss on edited tokens (sparse structural edits)
+  mask_quantile: 0.75
+  mask_bg_weight: 0.2     # background keeps 20% weight (copy/consistency signal)
+  # train_list: config/your_oversample_list.json   # optional: repeats oversample edit types
+
+optim:
+  lr: 1.0e-5             # LOW: adapting a pretrained model that already carries fp8 quant noise
+  steps: 3000
+  batch: 2              # fused back pass requires accum=1; raise if VRAM allows
+  accum: 1
+  warmup: 100
+  optimizer: adamw      # entrypoint always uses fused-back-pass AdamW + stochastic rounding
+  lr_scheduler: cosine
+  min_lr_ratio: 0.1
+  grad_clip: 1.0
+  cfg_dropout_prob: 0.1
+  # offload_optimizer: true   # keep Adam moments in CPU RAM -> fits a 24GB card (~21GiB peak,
+  #   batch 1) instead of ~58GB. Needs ~74GB host RAM and is much slower (~33s/step vs ~3.5s:
+  #   CPU Adam + per-param PCIe). Recommended env: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+flow:
+  timestep_shift: 1.0    # native noise-heavy distribution (structure is set at high noise)
+  min_snr_gamma: 5.0
+
+logging:
+  log_every: 10
+  ckpt_every: 1000
+  sample_every: 250
+  sample_steps: 24
+  sample_guidance: 3.5

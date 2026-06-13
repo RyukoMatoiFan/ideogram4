@@ -164,6 +164,49 @@ def sample_t2i(
 
 
 @torch.no_grad()
+def sample_uncond(
+  transformer: torch.nn.Module,
+  grid_h: int,
+  grid_w: int,
+  *,
+  schedule: LogitNormalSchedule,
+  num_steps: int = 20,
+  generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+  """Sample from the UNCONDITIONAL transformer alone (no text, no CFG).
+
+  The uncond branch is image-only (``build_t2i_sequence_meta(num_text=0)``, zeroed
+  ``llm_features``), so one forward per step. This is the in-training probe for a
+  negative-model LoRA: at adapter scale 0 it draws from the base unconditional prior;
+  at scale 1 the draw should visibly shift toward whatever the LoRA was trained on
+  (e.g. degraded images) -- a direct picture of what the adapter learned.
+  Returns the latent ``(1, n, 128)`` -- decode with ``decode_latents``.
+  """
+  from ideogram4.train_t2i import build_t2i_sequence_meta
+
+  device = next(transformer.parameters()).device
+  n = grid_h * grid_w
+  latent_dim = transformer.config.in_channels
+  llm_dim = transformer.config.llm_features_dim
+
+  meta = build_t2i_sequence_meta(0, grid_h, grid_w, device)
+  llm = torch.zeros(1, n, llm_dim, device=device, dtype=torch.float32)
+
+  step_intervals = make_step_intervals(num_steps).to(device)
+  z = torch.randn(1, n, latent_dim, device=device, dtype=torch.float32, generator=generator)
+
+  for i in range(num_steps - 1, -1, -1):
+    t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
+    s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
+    t = torch.full((1,), t_val, dtype=torch.float32, device=device)
+    v = transformer(
+      llm_features=llm, x=z, t=t, position_ids=meta["position_ids"],
+      segment_ids=meta["segment_ids"], indicator=meta["indicator"])
+    z = z + v * (s_val - t_val)
+  return z
+
+
+@torch.no_grad()
 def sample_multiref(
   transformer: torch.nn.Module,
   z_refs: list[torch.Tensor],

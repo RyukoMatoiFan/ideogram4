@@ -64,6 +64,8 @@ class DataConfig:
   n_eval_holdout: int = 4
   masked_loss: bool = False        # weight loss to the edited region (derive_edit_mask)
   mask_quantile: float = 0.5       # tokens with top (1-q) |z_tgt-z_ref| are in the mask
+  mask_bg_weight: float = 0.0      # soft mask: background weight (0 = hard mask; e.g. 0.2)
+  train_list: str = ""             # JSON list of cache filenames (repeats = oversampling)
   aspect_bucketing: bool = False   # precache at nearest-AR bucket instead of square-squash
   bucket_pixels: int = 0           # target area for buckets; 0 -> resolution^2
   num_buckets: int = 9
@@ -87,6 +89,11 @@ class OptimConfig:
   min_lr_ratio: float = 0.0        # LR floor (fraction of base) the decay approaches
   num_restarts: int = 1            # cycles for cosine_restarts
   prior_preservation_weight: float = 0.0  # keep background near the frozen base (anti-forgetting)
+  offload_optimizer: bool = False  # full-FT: keep Adam moments in CPU RAM (~21GB VRAM vs ~58GB)
+  anchor_weight: float = 1.0       # uncond LoRA: weight of the no-op-on-clean regularizer
+                                   # (disentangles the degradation axis from dataset content)
+  weight_decay: float = 0.01       # full-FT AdamW weight decay (train_edit_full_cached.py)
+  preload_caches: bool = True      # full-FT trainers: preload latent caches into RAM
 
 
 @dataclass
@@ -142,6 +149,7 @@ class LoggingConfig:
   sample_steps: int = 20      # sampler steps for in-training samples
   sample_guidance: float = 2.0
   sample_count: int = 4       # how many prompts/items to sample each time
+  preview_dir: str = ""       # dir of curated preview_*.pt (llm_text only) -> T2I-only dashboard
 
 
 @dataclass

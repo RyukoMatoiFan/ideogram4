@@ -138,22 +138,6 @@ def load_bnb4bit_state_dict(
 # ---------------------------------------------------------------------------
 
 
-def quantize_weight_to_fp8(
-  weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Quantize a 2-D Linear weight to e4m3 float8 with per-row scales.
-
-  Returns ``(weight_fp8, scale)`` where ``weight_fp8`` has shape ``(out, in)``
-  in ``float8_e4m3fn`` and ``scale`` has shape ``(out,)`` in float32 such that
-  ``weight ≈ weight_fp8.to(dtype) * scale[:, None]``.
-  """
-  w = weight.detach().to(torch.float32)
-  amax = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-  scale = amax / FP8_E4M3_MAX
-  q = (w / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(FP8_WEIGHT_DTYPE)
-  return q, scale.squeeze(1).to(torch.float32)
-
-
 def is_fp8_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
   """True if the checkpoint carries weight-only FP8 Linear weights."""
   return any(k.endswith(FP8_SCALE_SUFFIX) for k in state_dict) or any(

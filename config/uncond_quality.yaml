@@ -1,0 +1,48 @@
+# Negative-model (uncond) quality LoRA. Train the UNCONDITIONAL transformer on
+# degraded images (precache_uncond.py); at inference hook the adapter into the uncond
+# ONLY -- CFG's (1-g)<0 coefficient then steers away from the degradation manifold,
+# amplified by (g-1). scale>0 = cleaner, scale<0 = degraded (causal check).
+#   python precache_uncond.py --config config/uncond_quality.yaml
+#   python train_uncond_lora.py --config config/uncond_quality.yaml
+#   python eval_uncond_lora.py --ckpt runs/uncond-quality/ckpts/uncond_rank16_final.safetensors
+paths:
+  weights: ideogram-ai/ideogram-4-fp8
+  data_root: data/uncond-source       # any varied image folder; degradations are generated
+  cache_dir: data/uncond-cache
+  output_dir: runs/uncond-quality
+  ckpt_dir: runs/uncond-quality/ckpts
+
+lora:
+  rank: 16                  # quality is a coarse axis; small rank disentangles better
+
+data:
+  resolution: 512
+  n_eval_holdout: 32
+
+optim:
+  lr: 1.0e-4
+  steps: 2000
+  batch: 4
+  accum: 1
+  warmup: 50
+  optimizer: adamw
+  lr_scheduler: cosine
+  min_lr_ratio: 0.1
+  grad_clip: 1.0
+  grad_checkpointing: true  # REQUIRED on the fp8 base: Fp8Linear dequantizes per-forward,
+                            # and without checkpointing autograd retains every layer's
+                            # dequantized bf16 weight in the graph (~17GB per grad pass)
+  anchor_weight: 1.0        # no-op-on-clean regularizer: cancels the dataset's content/
+                            # style component so only the degradation axis is learned
+
+flow:
+  timestep_shift: 3.0       # bias t toward the data side: degradation is only visible in
+                            # x_t at low noise -- at high noise flow and anchor conflict
+
+logging:
+  log_every: 25
+  ckpt_every: 500
+  val_every: 100            # deterministic held-out val loss (fixed timesteps)
+  sample_every: 250         # uncond-only draws [base | lora]: right column should degrade
+  sample_count: 2
+  sample_steps: 20

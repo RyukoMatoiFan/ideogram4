@@ -122,13 +122,6 @@ def nearest_bucket(w: int, h: int, buckets: list) -> tuple:
   return min(buckets, key=lambda b: abs(math.log(b[1] / b[0]) - ar))
 
 
-def resize_to_bucket(img, bucket_hw):
-  """Resize a PIL image to a bucket (H, W). The bucket AR ~matches the image, so
-  this is a near-isotropic resize (minimal distortion vs square-squash)."""
-  h, w = bucket_hw
-  return img.convert("RGB").resize((w, h))
-
-
 def noise_with_offset(shape, offset: float, *, generator=None, device=None, dtype=torch.float32):
   """Sample (B, n, D) noise with an optional per-channel constant offset.
 
@@ -330,11 +323,16 @@ def load_training_state(path, *, optimizer, scheduler, wrapped, ema=None, gen=No
   if ema is not None and state.get("ema") is not None:
     ema.load_state_dict(state["ema"])
   random.setstate(state["rng_python"])
-  torch.set_rng_state(state["rng_torch"])
-  if state.get("rng_cuda") is not None and torch.cuda.is_available():
-    torch.cuda.set_rng_state_all(state["rng_cuda"])
-  if gen is not None and state.get("gen") is not None:
-    gen.set_state(state["gen"])
+  # RNG states must be CPU ByteTensors -- map_location may have moved them to CUDA.
+  # Restoration only affects noise reproducibility, so never let it abort a resume.
+  try:
+    torch.set_rng_state(state["rng_torch"].cpu().to(torch.uint8))
+    if state.get("rng_cuda") is not None and torch.cuda.is_available():
+      torch.cuda.set_rng_state_all([s.cpu().to(torch.uint8) for s in state["rng_cuda"]])
+    if gen is not None and state.get("gen") is not None:
+      gen.set_state(state["gen"].cpu().to(torch.uint8))
+  except Exception as e:
+    print(f"[resume] RNG state restore skipped ({e}); continuing", flush=True)
   return state["step"], state.get("extra", {})
 
 
