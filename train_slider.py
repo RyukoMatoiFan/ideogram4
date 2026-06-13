@@ -7,9 +7,12 @@ full pipeline once to (a) encode the c+/c-/anchor prompts to LLM feature rows an
 (b) VAE-encode a folder of *context* images the slider should act on, then iterate the
 slider step on the conditional transformer with an injected LoRA.
 
-At inference, dial strength with lora.lora_scaled(transformer, factor) and sample
-normally (factor>0 enhances, <0 inverts), or apply the same adapter to BOTH
-transformers as with any edit LoRA.
+At inference, dial strength with lora.lora_scaled(transformer, factor) and sample with
+OUR cached samplers (sample_edit_cached / sample_t2i, factor>0 enhances, <0 inverts).
+Do NOT judge a slider through the stock dual-transformer pipeline: its negative branch
+is a separate unconditional network, so the zero-text anchor trained here never occurs
+there and a both-transformers adapter largely cancels under CFG. For a stock-pipeline
+quality knob train the negative-model (uncond) LoRA instead (train_uncond_lora.py).
 
   CUDA_VISIBLE_DEVICES=0 python train_slider.py --config config/slider.yaml
 """
@@ -32,8 +35,6 @@ from ideogram4.scheduler import get_schedule_for_resolution
 from ideogram4 import train_edit
 from ideogram4 import lora as loramod
 from ideogram4.training_utils import build_optimizer, build_lr_scheduler, is_finite_loss
-
-_LATENT_DIM = 128  # ig4 patch-latent width
 
 _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -73,9 +74,6 @@ def main():
   ap.add_argument("--rollout", type=int, default=0,
                   help="If >0, generate this many context images from the base model "
                        "(zero external data) instead of reading paths.data_root.")
-  ap.add_argument("--noise", action="store_true",
-                  help="Image-free mode: probe x_t at random latents (no rollout, no "
-                       "folder, no VAE). Only the text encoder is loaded -> stays <=24GB.")
   args = ap.parse_args()
 
   from ideogram4.training_config import load_config, apply_runtime, dtype_of
@@ -101,11 +99,10 @@ def main():
   patch = pcfg.patch_size * pcfg.ae_scale_factor
   ps = pcfg.patch_size
   grid = res // patch
-  noise_mode = bool(args.noise)
-  needs_gen = (not noise_mode) and (args.rollout > 0)  # only rollout has to GENERATE
+  needs_gen = args.rollout > 0  # only rollout has to GENERATE
 
   # --- Phase 1: load the encoder(s) to encode prompts (+ context). Only --rollout needs
-  # the full pipeline (it generates); noise/folder load encoders-only and stay <=24GB. ---
+  # the full pipeline (it generates); folder mode loads encoders-only and stays <=24GB. ---
   t0 = time.time()
   if needs_gen:
     enc_pipe = Ideogram4Pipeline.from_pretrained(
@@ -114,7 +111,7 @@ def main():
   else:
     enc_pipe = train_edit.load_encoders_pipeline(cfg.paths.weights, device, dtype)
     print(f"[slider] encoders loaded in {time.time()-t0:.1f}s "
-          f"({'image-free noise' if noise_mode else 'folder'} mode, <=24GB) | grid {grid}x{grid}", flush=True)
+          f"(folder mode, <=24GB) | grid {grid}x{grid}", flush=True)
 
   # --- encode the +/- (and anchor) prompts to padded rows ---
   rows_pos = _encode_prompt_rows(enc_pipe, s.positive_prompt, grid)
@@ -126,7 +123,7 @@ def main():
   llm_pos = _pad_rows(rows_pos, num_text, llm_dim, device)
   llm_neg = _pad_rows(rows_neg, num_text, llm_dim, device)
   llm_anchor = _pad_rows(rows_anc, num_text, llm_dim, device) if rows_anc is not None else None
-  ctx_name = "noise" if noise_mode else ("rollout" if needs_gen else "folder")
+  ctx_name = "rollout" if needs_gen else "folder"
   print(f"[slider] axis: (+)'{s.positive_prompt[:40]}' (-)'{s.negative_prompt[:40]}' "
         f"| num_text={num_text} eta={s.eta} ctx={ctx_name}", flush=True)
 
@@ -138,36 +135,35 @@ def main():
       sample_llm.append(_encode_prompt_rows(enc_pipe, _ROLLOUT_PROMPTS[k], grid).to(torch.float32).cpu())
     print(f"[slider] pre-encoded {len(sample_llm)} preview prompts", flush=True)
 
-  # --- gather context latents (None for image-free noise mode; x_t is random there) ---
-  z_ctxs = None
-  if not noise_mode:
-    z_ctxs = []
-    if args.rollout > 0:
-      with torch.no_grad():
-        for k in range(args.rollout):
-          img = enc_pipe([_ROLLOUT_PROMPTS[k % len(_ROLLOUT_PROMPTS)]], height=res, width=res,
-                         num_steps=24, guidance_scale=5.0, seed=1000 + k, raise_on_caption_issues=False)[0]
-          ten = train_edit.images_to_tensor([img], res, res, device)
-          z_ctxs.append(train_edit.encode_image_tokens(enc_pipe, ten, patch_size=ps)[0].to(torch.float32).cpu())
-          if (k + 1) % 8 == 0:
-            print(f"[slider] rollout {k+1}/{args.rollout}", flush=True)
-      print(f"[slider] generated {len(z_ctxs)} rollout context images", flush=True)
-    else:
-      paths = []
-      for root, _, fnames in os.walk(cfg.paths.data_root):
-        for fn in fnames:
-          if fn.lower().endswith(_IMG_EXTS):
-            paths.append(os.path.join(root, fn))
-      paths.sort()
-      if not paths:
-        raise FileNotFoundError(
-          f"no context images under paths.data_root={cfg.paths.data_root!r}; "
-          "use --rollout N (self-generate) or --noise (image-free)")
-      with torch.no_grad():
-        for p in paths:
-          ten = train_edit.images_to_tensor([Image.open(p).convert("RGB")], res, res, device)
-          z_ctxs.append(train_edit.encode_image_tokens(enc_pipe, ten, patch_size=ps)[0].to(torch.float32).cpu())
-      print(f"[slider] encoded {len(z_ctxs)} context images from {cfg.paths.data_root}", flush=True)
+  # --- gather context latents: real images only (a slider direction is only observable
+  # on structured x_t along real sampling trajectories, never on random latents) ---
+  z_ctxs = []
+  if args.rollout > 0:
+    with torch.no_grad():
+      for k in range(args.rollout):
+        img = enc_pipe([_ROLLOUT_PROMPTS[k % len(_ROLLOUT_PROMPTS)]], height=res, width=res,
+                       num_steps=24, guidance_scale=5.0, seed=1000 + k, raise_on_caption_issues=False)[0]
+        ten = train_edit.images_to_tensor([img], res, res, device)
+        z_ctxs.append(train_edit.encode_image_tokens(enc_pipe, ten, patch_size=ps)[0].to(torch.float32).cpu())
+        if (k + 1) % 8 == 0:
+          print(f"[slider] rollout {k+1}/{args.rollout}", flush=True)
+    print(f"[slider] generated {len(z_ctxs)} rollout context images", flush=True)
+  else:
+    paths = []
+    for root, _, fnames in os.walk(cfg.paths.data_root):
+      for fn in fnames:
+        if fn.lower().endswith(_IMG_EXTS):
+          paths.append(os.path.join(root, fn))
+    paths.sort()
+    if not paths:
+      raise FileNotFoundError(
+        f"no context images under paths.data_root={cfg.paths.data_root!r}; "
+        "use --rollout N (self-generate)")
+    with torch.no_grad():
+      for p in paths:
+        ten = train_edit.images_to_tensor([Image.open(p).convert("RGB")], res, res, device)
+        z_ctxs.append(train_edit.encode_image_tokens(enc_pipe, ten, patch_size=ps)[0].to(torch.float32).cpu())
+    print(f"[slider] encoded {len(z_ctxs)} context images from {cfg.paths.data_root}", flush=True)
 
   # --- obtain the conditional transformer, free the rest ---
   if needs_gen:
@@ -231,15 +227,24 @@ def main():
     os.makedirs(sample_dir, exist_ok=True)
     sc = float(s.infer_scale)
     transformer.eval()
+    is_t2i = str(s.context) == "t2i"
     rows = []
     for llm in sample_llm:
       panels = []
       for factor in (-sc, 0.0, sc):
+        # Per-step LOCAL generator (re-seeded each panel) so the training RNG stream is untouched.
+        local_gen = torch.Generator(device=device).manual_seed(step_num)
         with lora_scaled(transformer, factor):
-          z = edit_sampler.sample_t2i(
-            transformer, llm.to(device), grid, grid, schedule=schedule,
-            num_steps=int(cfg.logging.sample_steps), guidance_scale=float(cfg.logging.sample_guidance),
-            generator=torch.Generator(device=device).manual_seed(step_num))
+          if is_t2i:
+            z = edit_sampler.sample_t2i(
+              transformer, llm.to(device), grid, grid, schedule=schedule,
+              num_steps=int(cfg.logging.sample_steps), guidance_scale=float(cfg.logging.sample_guidance),
+              generator=local_gen)
+          else:
+            z = edit_sampler.sample_edit_cached(
+              transformer, z_ctxs[0].to(device), llm.to(device), grid, grid, schedule=schedule,
+              num_steps=int(cfg.logging.sample_steps), guidance_scale=float(cfg.logging.sample_guidance),
+              generator=local_gen)
         panels.append(edit_sampler.decode_latents(
           ae, z, grid, grid, patch_size=dpatch, latent_shift=shift, latent_scale=lscale, dtype=dtype)[0])
       rows.append(panels)
@@ -256,8 +261,7 @@ def main():
     opt.zero_grad()
     acc = 0.0
     for _ in range(accum):
-      z_ctx = (torch.randn(grid * grid, _LATENT_DIM, device=device, generator=gen)
-               if noise_mode else z_ctxs[rng.randrange(len(z_ctxs))].to(device))
+      z_ctx = z_ctxs[rng.randrange(len(z_ctxs))].to(device)
       loss = train_edit.slider_training_step(
         transformer, z_ctx, llm_pos, llm_neg, grid, grid, schedule=schedule,
         llm_anchor=llm_anchor, eta=float(s.eta), slider_scale=float(s.train_scale),

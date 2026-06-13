@@ -2,8 +2,12 @@
 # No paired targets: slider_training_step regresses the +/- adapter onto the FROZEN
 # base's own prediction, nudged along (positive_prompt - negative_prompt) in velocity
 # space. At inference, dial strength with lora.lora_scaled(transformer, infer_scale)
-# (factor>0 enhances, <0 inverts) and run sample_edit_cached; or use prompt-defined
-# guidance via edit_sampler.sample_edit_sliders without training at all.
+# (factor>0 enhances, <0 inverts) and run sample_edit_cached / sample_t2i; or use
+# prompt-defined guidance via edit_sampler.sample_edit_sliders without training at all.
+# Scope: sliders are for OUR cfg-dropout-trained samplers (the fine-tuned editor, or a
+# fine-tuned T2I via sample_t2i). The STOCK pipeline's negative branch is a separate
+# unconditional network -- a slider cannot transfer there; for a stock-pipeline quality
+# knob use the negative-model uncond LoRA (config/uncond_quality.yaml) instead.
 # Train on a folder of context images (data_root); rank can be small -- a slider is a
 # coarse direction, not a task. Run: python train_slider.py --config config/slider.yaml
 paths:
@@ -26,10 +30,6 @@ optim:
   optimizer: adamw
   grad_checkpointing: true   # two training graphs (+/- passes) at 512px need this
 
-flow:
-  timestep_shift: 1.0
-  timestep_weighting: uniform
-
 slider:
   positive_prompt: "highly detailed, sharp, intricate texture, fine details"
   negative_prompt: "blurry, smooth, low detail, soft, out of focus"
@@ -37,9 +37,9 @@ slider:
   eta: 2.0                    # direction strength defining the train targets
   train_scale: 1.0            # +/- adapter scale during training
   bidirectional: true         # true: ± knob; false: enhance-only (+scale only)
-  context: t2i                # train in the layout used at inference: t2i (T2I gen) | edit
+  context: edit               # MUST match the inference layout: edit (in-context editor,
+                              # the default use) | t2i (a cfg-dropout fine-tuned T2I model)
   infer_scale: 2.0            # default strength at inference
-  late_step_frac: 0.4         # apply only in the final 40% of steps (detail tail)
 
 logging:
   log_every: 25

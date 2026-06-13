@@ -71,6 +71,10 @@ def main():
     ten = train_edit.images_to_tensor([img], res, res, pipe.device)
     return train_edit.encode_image_tokens(pipe, ten, patch_size=ps)[0].to(torch.bfloat16).cpu()
 
+  def _atomic_save(obj, out):
+    torch.save(obj, out + ".tmp")  # never leave a truncated .pt behind a crash:
+    os.replace(out + ".tmp", out)  # exists()-skip resume would treat it as done
+
   t0 = time.time()
   done = 0
   for i, m in enumerate(meta):
@@ -90,7 +94,7 @@ def main():
     inputs = train_edit.build_edit_inputs(pipe, [m[instr_field]], grid, grid)
     llm = pipe._encode_text(inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"])
     llm_text = llm[0][inputs["indicator"][0] == LLM_TOKEN_INDICATOR].to(torch.bfloat16).cpu()
-    torch.save(
+    _atomic_save(
       {
         "z_refs": z_refs,
         "ref_grids": [(grid, grid)] * len(z_refs),

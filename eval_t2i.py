@@ -4,7 +4,7 @@ Loads the full pipeline, injects the trained adapter into BOTH transformers, and
 each prompt generates the same seed with the adapter off vs on. If the subject/style
 appears with the adapter on, the regular-LoRA path works.
 
-  CUDA_VISIBLE_DEVICES=7 python private/eval_t2i.py \
+  CUDA_VISIBLE_DEVICES=0 python eval_t2i.py \
     --ckpt runs/t2i-lora/ckpts/t2i_rank32_final.safetensors --rank 32
 """
 import argparse

@@ -164,7 +164,7 @@ def main():
         generator=torch.Generator(device=device).manual_seed(step_num))
       gh, gw = it["target_grid"]
       tgt = it["z_tgt"].unsqueeze(0)
-      imgs = edit_sampler.decode_latents(torch.cat([z_out, tgt], dim=0), gh, gw,
+      imgs = edit_sampler.decode_latents(ae, torch.cat([z_out, tgt], dim=0), gh, gw,
                                          patch_size=patch, latent_shift=shift,
                                          latent_scale=scale, dtype=dtype)
       w, h = imgs[0].size

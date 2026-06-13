@@ -111,7 +111,12 @@ def main():
       )
       mask = inputs["indicator"][0] == LLM_TOKEN_INDICATOR
       llm_text = llm[0][mask]  # (num_text, llm_dim)
-      torch.save(
+
+      def _atomic_save(obj, out):
+        torch.save(obj, out + ".tmp")  # never leave a truncated .pt behind a crash:
+        os.replace(out + ".tmp", out)  # exists()-skip resume would treat it as done
+
+      _atomic_save(
         {
           "z_ref": z_ref.to(torch.bfloat16).cpu(),
           "z_tgt": z_tgt.to(torch.bfloat16).cpu(),
