@@ -64,6 +64,8 @@ def main():
   ap.add_argument("--num-shards", type=int, default=1, help="split across N parallel processes (one GPU each)")
   ap.add_argument("--shard", type=int, default=0, help="this process's shard id in [0, num_shards)")
   ap.add_argument("--raw-caption", action="store_true", help="skip prose cleaning (for tag captions)")
+  ap.add_argument("--te-ckpt", default="", help="re-precache with a fine-tuned text encoder "
+                  "(decoupled: TE stage -> re-precache -> fast cached DiT full-FT)")
   args = ap.parse_args()
   num_shards = max(1, int(args.num_shards)); shard_id = int(args.shard) % num_shards
 
@@ -76,6 +78,13 @@ def main():
   t0 = time.time()
   pipe = train_edit.load_encoders_pipeline(cfg.paths.weights, cfg.runtime.device, dtype_of(cfg))
   print(f"[precache-t2i] encoders loaded in {time.time()-t0:.1f}s", flush=True)
+  if args.te_ckpt:  # decoupled: encode features with the fine-tuned (dequantized) text encoder
+    from safetensors.torch import load_file
+    train_edit.dequantize_fp8_transformer(pipe.text_encoder, dtype=dtype_of(cfg))
+    res_keys = pipe.text_encoder.load_state_dict(load_file(args.te_ckpt), strict=False)
+    pipe.text_encoder.to(cfg.runtime.device).eval()
+    print(f"[precache-t2i] loaded fine-tuned TE {args.te_ckpt} "
+          f"({len(res_keys.missing_keys)} missing, {len(res_keys.unexpected_keys)} unexpected)", flush=True)
   patch = pipe.config.patch_size * pipe.config.ae_scale_factor
   ps = pipe.config.patch_size
 

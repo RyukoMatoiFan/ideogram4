@@ -745,6 +745,69 @@ def edit_training_step_cached_batch(
   return loss
 
 
+def te_edit_training_step(
+  transformer: nn.Module,
+  pipeline: Ideogram4Pipeline,
+  instruction: str,
+  z_ref: torch.Tensor,
+  z_tgt: torch.Tensor,
+  grid_h: int,
+  grid_w: int,
+  *,
+  schedule: LogitNormalSchedule,
+  cfg_dropout_prob: float = 0.1,
+  timestep_shift: float = 1.0,
+  generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+  """One edit flow-matching step with a LIVE, trainable text encoder (TE-LoRA).
+
+  Unlike the cached steps, the instruction's features are computed in-loop through
+  ``pipeline.text_encoder`` (so gradient reaches a TE adapter), while the image latents
+  ``z_ref``/``z_tgt`` come from the VAE cache. The DiT may be frozen or carry its own
+  adapter; either way gradient flows back to the TE through ``llm_features``.
+
+  Batch 1 (one instruction); use gradient accumulation for a larger effective batch.
+  """
+  from ideogram4.training_utils import apply_flux_shift
+
+  device = z_tgt.device
+  n = grid_h * grid_w
+  latent_dim = z_tgt.shape[-1]
+
+  inputs = build_edit_inputs(pipeline, [instruction], grid_h, grid_w)
+  llm_features = pipeline._encode_text(
+    inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"],
+    requires_grad=True,  # gradient must reach the TE-LoRA adapter
+  )  # (1, L, llm_dim), differentiable w.r.t. the TE adapter
+  if cfg_dropout_prob > 0.0 and torch.rand((), device=device, generator=generator).item() < cfg_dropout_prob:
+    llm_features = llm_features * 0.0  # drop the instruction (keeps the reference-only conditional)
+
+  ref_mask = inputs["indicator"] == REFERENCE_IMAGE_INDICATOR
+  tgt_mask = inputs["indicator"] == OUTPUT_IMAGE_INDICATOR
+
+  z_ref = z_ref.view(1, n, latent_dim).to(torch.float32)
+  z_tgt = z_tgt.view(1, n, latent_dim).to(torch.float32)
+  noise = torch.randn(1, n, latent_dim, device=device, dtype=torch.float32, generator=generator)
+  t = schedule(torch.rand((1,), device=device, generator=generator)).to(torch.float32)
+  if timestep_shift != 1.0:
+    t = apply_flux_shift(t, timestep_shift)
+  t_b = t.view(1, 1, 1)
+  x_t = t_b * z_tgt + (1.0 - t_b) * noise
+  v_target = z_tgt - noise
+
+  seq_len = inputs["indicator"].shape[1]
+  x = torch.zeros(1, seq_len, latent_dim, device=device, dtype=torch.float32)
+  x[ref_mask] = z_ref.reshape(-1, latent_dim)
+  x[tgt_mask] = x_t.reshape(-1, latent_dim)
+
+  pred = transformer(
+    llm_features=llm_features, x=x, t=t,
+    position_ids=inputs["position_ids"], segment_ids=inputs["segment_ids"],
+    indicator=inputs["indicator"],
+  )
+  return F.mse_loss(pred[tgt_mask].reshape(1, n, latent_dim), v_target)
+
+
 # --------------------------------------------------------------------------- #
 # Full-rank finetuning helpers
 # --------------------------------------------------------------------------- #

@@ -428,6 +428,8 @@ class Ideogram4Pipeline:
     token_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     pos_2d: torch.Tensor,
+    *,
+    checkpoint: bool = False,
   ) -> list[torch.Tensor]:
     language_model = self.text_encoder.language_model
 
@@ -447,18 +449,34 @@ class Ideogram4Pipeline:
     position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
 
     tap_set = set(QWEN3_VL_ACTIVATION_LAYERS)
+    last_tap = max(tap_set)
     captured: dict[int, torch.Tensor] = {}
     hidden_states = inputs_embeds
+    # Gradient-checkpoint each layer when training the TE (the manual loop bypasses HF's
+    # own grad-ckpt flag), else activations of all layers blow up VRAM. use_reentrant=False
+    # so it works with kwargs + non-leaf inputs.
+    use_ckpt = checkpoint and torch.is_grad_enabled()
+    if use_ckpt:
+      from torch.utils.checkpoint import checkpoint as _ckpt
     for layer_idx, decoder_layer in enumerate(language_model.layers):
-      hidden_states = decoder_layer(
-        hidden_states,
-        attention_mask=causal_mask,
-        position_ids=text_position_ids,
-        past_key_values=None,
-        position_embeddings=position_embeddings,
-      )
+      if use_ckpt:
+        hidden_states = _ckpt(
+          decoder_layer, hidden_states, attention_mask=causal_mask,
+          position_ids=text_position_ids, past_key_values=None,
+          position_embeddings=position_embeddings, use_reentrant=False,
+        )
+      else:
+        hidden_states = decoder_layer(
+          hidden_states,
+          attention_mask=causal_mask,
+          position_ids=text_position_ids,
+          past_key_values=None,
+          position_embeddings=position_embeddings,
+        )
       if layer_idx in tap_set:
         captured[layer_idx] = hidden_states
+      if layer_idx >= last_tap:
+        break  # deeper layers never affect the tapped outputs (saves compute/VRAM)
 
     return [captured[i] for i in QWEN3_VL_ACTIVATION_LAYERS]
 
@@ -467,10 +485,14 @@ class Ideogram4Pipeline:
     token_ids: torch.Tensor,
     text_position_ids: torch.Tensor,
     indicator: torch.Tensor,
+    *,
+    requires_grad: bool = False,
   ) -> torch.Tensor:
     """Run Qwen3-VL and stack hidden states from the activation layers.
 
-    Returns a (B, L, hidden_size * num_layers) float32 tensor.
+    Returns a (B, L, hidden_size * num_layers) float32 tensor. ``requires_grad=True``
+    runs the text encoder WITH autograd so gradient can reach a TE-LoRA adapter
+    (text-encoder training); the default keeps the no-grad path for precache/inference.
     """
     batch_size, seq_len = token_ids.shape
 
@@ -479,8 +501,11 @@ class Ideogram4Pipeline:
 
     pos_2d = text_position_ids[..., 0].contiguous()
 
-    with torch.no_grad():
-      selected = self._get_qwen3_vl_embeddings(token_ids, attention_mask, pos_2d)
+    if requires_grad:
+      selected = self._get_qwen3_vl_embeddings(token_ids, attention_mask, pos_2d, checkpoint=True)
+    else:
+      with torch.no_grad():
+        selected = self._get_qwen3_vl_embeddings(token_ids, attention_mask, pos_2d)
     stacked = torch.stack(selected, dim=0)  # (num_taps, B, L, H)
     stacked = torch.permute(stacked, (1, 2, 3, 0))
     stacked = stacked.reshape(batch_size, seq_len, -1)

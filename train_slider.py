@@ -92,6 +92,9 @@ def main():
   os.makedirs(ckpt, exist_ok=True)
   os.makedirs(output_dir, exist_ok=True)
   metrics_path = os.path.join(output_dir, "metrics.jsonl")
+  from ideogram4.trackers import Tracker
+  tracker = Tracker(cfg.logging.tracker, project=cfg.logging.wandb_project,
+                    run_name=cfg.logging.run_name or None, out_dir=output_dir)
   open(metrics_path, "w").close()
 
   import gc
@@ -186,7 +189,8 @@ def main():
   print("[slider] training the conditional transformer only", flush=True)
 
   # --- inject the slider adapter ---
-  wrapped = loramod.inject_lora(transformer, rank=rank)
+  wrapped = loramod.inject_lora(transformer, rank=rank,
+                                variant=cfg.lora.variant, target_adaln=cfg.lora.target_adaln)
   params = loramod.lora_parameters(wrapped)
   if bool(cfg.optim.grad_checkpointing):
     transformer.gradient_checkpointing = True
@@ -194,7 +198,8 @@ def main():
   sched_lr = build_lr_scheduler(
     opt, scheduler=cfg.optim.lr_scheduler, warmup=int(cfg.optim.warmup), total_steps=steps,
     num_restarts=int(cfg.optim.num_restarts), min_lr_ratio=float(cfg.optim.min_lr_ratio))
-  schedule = get_schedule_for_resolution((res, res), known_mean=1.0)
+  schedule = get_schedule_for_resolution(
+    (res, res), known_mean=cfg.flow.schedule_mean, std=cfg.flow.schedule_std)
   print(f"[slider] LoRA rank {rank}: {len(wrapped)} modules, "
         f"{sum(p.numel() for p in params)/1e6:.1f}M params", flush=True)
 
@@ -276,9 +281,11 @@ def main():
     run += acc
     now = time.time(); step_dt = now - t_step_prev; t_step_prev = now
     pgb = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0
+    rec = {"step": step + 1, "loss": acc, "lr": sched_lr.get_last_lr()[0],
+           "s_per_step": step_dt, "peak_gb": pgb, "total": steps}
     with open(metrics_path, "a") as mf:  # per-step metrics (dense for the dashboard)
-      mf.write(json.dumps({"step": step + 1, "loss": acc, "lr": sched_lr.get_last_lr()[0],
-                           "s_per_step": step_dt, "peak_gb": pgb, "total": steps}) + "\n")
+      mf.write(json.dumps(rec) + "\n")
+    tracker.log(rec, rec["step"])
     if (step + 1) % log_every == 0:  # console print cadence (windowed average)
       print(f"[slider] step {step+1}/{steps} loss {run/log_every:.4f} lr {sched_lr.get_last_lr()[0]:.2e} "
             f"| {(now-t_last)/log_every:.2f}s/step peak {pgb:.1f}GB", flush=True)

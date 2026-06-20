@@ -76,6 +76,9 @@ def main():
   os.makedirs(ckpt, exist_ok=True)
   os.makedirs(output_dir, exist_ok=True)
   metrics_path = os.path.join(output_dir, "metrics.jsonl")
+  from ideogram4.trackers import Tracker
+  tracker = Tracker(cfg.logging.tracker, project=cfg.logging.wandb_project,
+                    run_name=cfg.logging.run_name or None, out_dir=output_dir)
   state_path = os.path.join(ckpt, "train_state.pt")
   resume = (str(cfg.paths.resume_from or "") == "auto") and os.path.exists(state_path) \
            and not args.smoke
@@ -126,7 +129,8 @@ def main():
   del sd
   print(f"[uncond] UNCONDITIONAL transformer loaded in {time.time()-t0:.1f}s", flush=True)
 
-  wrapped = loramod.inject_lora(transformer, rank=rank, alpha=alpha)
+  wrapped = loramod.inject_lora(transformer, rank=rank, alpha=alpha,
+                                variant=cfg.lora.variant, target_adaln=cfg.lora.target_adaln)
   params = loramod.lora_parameters(wrapped)
   if bool(cfg.optim.grad_checkpointing):
     transformer.gradient_checkpointing = True
@@ -135,7 +139,8 @@ def main():
     opt, scheduler=cfg.optim.lr_scheduler, warmup=int(cfg.optim.warmup), total_steps=steps,
     num_restarts=int(cfg.optim.num_restarts), min_lr_ratio=float(cfg.optim.min_lr_ratio))
   res = grid_h * pcfg.patch_size * pcfg.ae_scale_factor
-  schedule = get_schedule_for_resolution((res, res), known_mean=1.0)
+  schedule = get_schedule_for_resolution(
+    (res, res), known_mean=cfg.flow.schedule_mean, std=cfg.flow.schedule_std)
   ts_shift = float(cfg.flow.timestep_shift)
   print(f"[uncond] LoRA rank {rank}: {len(wrapped)} modules, "
         f"{sum(p.numel() for p in params)/1e6:.1f}M params | ts_shift {ts_shift}", flush=True)
@@ -329,6 +334,7 @@ def main():
             f"@ step {step+1}", flush=True)
     with open(metrics_path, "a") as mf:
       mf.write(json.dumps(rec) + "\n")
+    tracker.log(rec, rec["step"])
     if (step + 1) % log_every == 0:
       print(f"[uncond] step {step+1}/{steps} flow {run_flow/log_every:.4f} "
             f"anchor {run_anchor/log_every:.4f} lr {sched_lr.get_last_lr()[0]:.2e} "

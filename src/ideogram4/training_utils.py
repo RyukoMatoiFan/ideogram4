@@ -44,12 +44,15 @@ def timestep_weight(
 ) -> torch.Tensor:
   """Per-sample loss weight as a function of timestep t (shape (B,)).
 
-  schemes:
-    "uniform"  -> 1 everywhere (no reweighting).
-    "bell"     -> Gaussian centred at t=0.5 (emphasise mid-noise timesteps).
-    "min_snr"  -> flow-matching min-SNR-gamma: min(SNR, gamma)/SNR, with
-                  SNR(t) = (t / (1 - t))^2. Down-weights easy (high-SNR / low-noise)
-                  timesteps so they do not dominate the gradient.
+  schemes (sigma = noise fraction = 1 - t in this repo's t=1-data convention):
+    "uniform"    -> 1 everywhere (no reweighting).
+    "bell"       -> Gaussian centred at t=0.5 (emphasise mid-noise timesteps).
+    "min_snr"    -> flow-matching min-SNR-gamma: min(SNR, gamma)/SNR, with
+                    SNR(t) = (t / (1 - t))^2. Down-weights easy (high-SNR / low-noise)
+                    timesteps so they do not dominate the gradient.
+    "sigma_sqrt" -> 1 / sigma^2 (SD3 loss weighting). Strongly up-weights low-noise
+                    (high-t) timesteps.
+    "cosmap"     -> 2 / (pi * (1 - 2*sigma + 2*sigma^2)) (SD3 cosine-map loss weighting).
   Returns weights with the same shape as t (non-negative).
   """
   if scheme == "uniform":
@@ -60,6 +63,13 @@ def timestep_weight(
     tc = t.clamp(1e-4, 1.0 - 1e-4)
     snr = (tc / (1.0 - tc)) ** 2
     return torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+  if scheme == "sigma_sqrt":
+    sigma = (1.0 - t).clamp(1e-4, 1.0)
+    return sigma ** -2.0
+  if scheme == "cosmap":
+    sigma = (1.0 - t).clamp(0.0, 1.0)
+    bot = 1.0 - 2.0 * sigma + 2.0 * sigma ** 2  # >= 0.5, never zero
+    return 2.0 / (math.pi * bot)
   raise ValueError(f"unknown timestep weighting scheme: {scheme!r}")
 
 
@@ -283,7 +293,9 @@ def is_schedule_free(name: str) -> bool:
 # Full training-state checkpoint (resume exactly: weights+opt+sched+RNG+step).
 # --------------------------------------------------------------------------- #
 def _lora_state(wrapped: dict) -> dict:
-  return {sub: (m.lora_A.detach().cpu(), m.lora_B.detach().cpu()) for sub, m in wrapped.items()}
+  # Variant-agnostic: each adapter dumps all its trainable tensors by name
+  # (lora_A/lora_B for LoRA; + dora_m for DoRA).
+  return {sub: m.adapter_state() for sub, m in wrapped.items()}
 
 
 def save_training_state(path, *, step, optimizer, scheduler, wrapped, ema=None, gen=None, extra=None):
@@ -312,11 +324,11 @@ def load_training_state(path, *, optimizer, scheduler, wrapped, ema=None, gen=No
   import random
 
   state = torch.load(path, map_location=map_location, weights_only=False)
-  with torch.no_grad():
-    for sub, m in wrapped.items():
-      a, b = state["lora"][sub]
-      m.lora_A.copy_(a.to(m.lora_A.device, m.lora_A.dtype))
-      m.lora_B.copy_(b.to(m.lora_B.device, m.lora_B.dtype))
+  for sub, m in wrapped.items():
+    saved = state["lora"][sub]
+    if isinstance(saved, (tuple, list)):  # back-compat: old (lora_A, lora_B) format
+      saved = {"lora_A": saved[0], "lora_B": saved[1]}
+    m.load_adapter_state(saved)
   optimizer.load_state_dict(state["optimizer"])
   if scheduler is not None and state.get("scheduler") is not None:
     scheduler.load_state_dict(state["scheduler"])

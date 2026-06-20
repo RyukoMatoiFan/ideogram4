@@ -14,6 +14,10 @@ lora:
 data:
   resolution: 512
 
+flow:
+  schedule_mean: 1.0     # default (safe). For T2I, tune toward your sampling preset:
+  schedule_std: 1.0      #   0.0 / 1.5 matches V4_QUALITY_48; pipeline default is 0.5 / 1.0
+
 optim:
   lr: 2.0e-4
   steps: 1500

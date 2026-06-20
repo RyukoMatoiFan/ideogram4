@@ -109,6 +109,78 @@ def t2i_training_step(
   return F.mse_loss(pred[tgt_mask].reshape(1, n, latent_dim), v_target)
 
 
+def t2i_te_training_step(
+  transformer: nn.Module,
+  pipeline,
+  caption: str,
+  z_tgt: torch.Tensor,
+  grid_h: int,
+  grid_w: int,
+  *,
+  schedule: LogitNormalSchedule,
+  cfg_dropout_prob: float = 0.1,
+  timestep_shift: float = 1.0,
+  generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+  """One plain text-to-image flow step with a LIVE, trainable text encoder.
+
+  The T2I analogue of ``train_edit.te_edit_training_step``: the caption is encoded
+  in-loop through ``pipeline.text_encoder`` (gradient reaches a trained TE), while the
+  target latent ``z_tgt`` comes from the VAE cache. Packs ``[text][target]`` (no
+  reference frame) and regresses the velocity over the image tokens. Batch 1.
+  """
+  from ideogram4.constants import LLM_TOKEN_INDICATOR
+  from ideogram4.train_edit import build_edit_inputs
+  from ideogram4.training_utils import apply_flux_shift
+
+  device = z_tgt.device
+  n = grid_h * grid_w
+  latent_dim = z_tgt.shape[-1]
+
+  # Live text features (gradient flows to the text encoder). build_edit_inputs is reused
+  # only to tokenize + pack the text; the image-block layout is irrelevant to the text
+  # rows we extract (the TE attends over text positions only).
+  inputs = build_edit_inputs(pipeline, [caption], grid_h, grid_w)
+  llm_full = pipeline._encode_text(
+    inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"], requires_grad=True
+  )
+  text_mask = inputs["indicator"][0] == LLM_TOKEN_INDICATOR
+  llm_text = llm_full[0][text_mask]  # (num_text, llm_dim), differentiable
+  num_text = llm_text.shape[0]
+  llm_dim = llm_text.shape[-1]
+
+  meta = build_t2i_sequence_meta(num_text, grid_h, grid_w, device)
+  indicator = meta["indicator"]
+  seq_len = indicator.shape[1]
+
+  llm = torch.zeros(1, seq_len, llm_dim, device=device, dtype=torch.float32)
+  drop = (
+    cfg_dropout_prob > 0.0
+    and torch.rand((), device=device, generator=generator).item() < cfg_dropout_prob
+  )
+  if not drop:
+    llm[0, :num_text] = llm_text.to(torch.float32)  # scatter keeps the grad path to the TE
+
+  z0 = z_tgt.view(1, n, latent_dim).to(torch.float32)
+  noise = torch.randn(1, n, latent_dim, device=device, dtype=torch.float32, generator=generator)
+  t = schedule(torch.rand((1,), device=device, generator=generator)).to(torch.float32)
+  if timestep_shift != 1.0:
+    t = apply_flux_shift(t, timestep_shift)
+  t_b = t.view(1, 1, 1)
+  x_t = t_b * z0 + (1.0 - t_b) * noise
+  v_target = z0 - noise
+
+  tgt_mask = indicator == OUTPUT_IMAGE_INDICATOR
+  x = torch.zeros(1, seq_len, latent_dim, device=device, dtype=torch.float32)
+  x[tgt_mask] = x_t.reshape(n, latent_dim)
+
+  pred = transformer(
+    llm_features=llm, x=x, t=t,
+    position_ids=meta["position_ids"], segment_ids=meta["segment_ids"], indicator=indicator,
+  )
+  return F.mse_loss(pred[tgt_mask].reshape(1, n, latent_dim), v_target)
+
+
 def uncond_training_step_cached(
   transformer: nn.Module,
   z_tgts: torch.Tensor,

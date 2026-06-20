@@ -1,0 +1,31 @@
+# Joint text-encoder + DiT LoRA training for in-context editing (train_te_lora_cached.py).
+# Reuses precache_edit caches (z_ref/z_tgt + raw instruction); runs Qwen3-VL live so a
+# TE-LoRA adapter can learn. Needs an 80GB-class GPU (DiT + text encoder co-resident).
+#   CUDA_VISIBLE_DEVICES=3 python train_te_lora_cached.py --config config/te_lora.yaml --smoke
+paths:
+  weights: ideogram-ai/ideogram-4-fp8   # HF id or local dir; real machine paths -> config/local.yaml
+  cache_dir: data/edit-single/cache
+  output_dir: runs/te-lora
+
+lora:
+  rank: 32                # DiT-LoRA rank
+  te_rank: 16             # text-encoder LoRA rank
+  variant: lora           # lora | dora | loha | lokr (applies to both)
+  train_transformer: true # true = joint DiT-LoRA + TE-LoRA; false = freeze DiT, train TE only
+
+data:
+  resolution: 1024
+
+optim:
+  lr: 1.0e-4
+  steps: 3000
+  accum: 4                # effective batch (batch is forced to 1 for the live TE)
+  warmup: 50
+  optimizer: adamw8bit
+  grad_checkpointing: true
+  cfg_dropout_prob: 0.1
+
+logging:
+  log_every: 10
+  ckpt_every: 500
+  tracker: none           # none | wandb | tensorboard

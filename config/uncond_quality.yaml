@@ -36,6 +36,8 @@ optim:
                             # style component so only the degradation axis is learned
 
 flow:
+  schedule_mean: 1.0        # keep this run's original sampled-t center (timestep_shift below
+  schedule_std: 1.0         # was tuned against it); do not inherit the recalibrated default
   timestep_shift: 3.0       # bias t toward the data side: degradation is only visible in
                             # x_t at low noise -- at high noise flow and anchor conflict
 

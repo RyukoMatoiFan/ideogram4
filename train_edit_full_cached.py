@@ -88,6 +88,9 @@ def main():
   os.makedirs(output_dir, exist_ok=True)
   sample_dir = os.path.join(output_dir, "samples")
   metrics_path = os.path.join(output_dir, "metrics.jsonl")
+  from ideogram4.trackers import Tracker
+  tracker = Tracker(cfg.logging.tracker, project=cfg.logging.wandb_project,
+                    run_name=cfg.logging.run_name or None, out_dir=output_dir)
   if not (cfg.paths.resume_from and os.path.exists(_resume_marker(ckpt))):
     open(metrics_path, "w").close()
 
@@ -115,6 +118,10 @@ def main():
 
   _sr_seed(cfg.runtime.seed, device)
   offload = bool(cfg.optim.offload_optimizer)
+  # Opt-in (DEFAULT OFF -> bit-identical when absent): persist AdamW moments for a WARM
+  # resume. Single file, overwritten each ckpt -> only the LATEST optimizer state is kept.
+  save_opt = bool(getattr(cfg.optim, "save_optimizer", False))
+  opt_path = f"{ckpt}/edit_full_optimizer.pt"
   opt = build_fused_adamw(
     [p for p in transformer.parameters() if p.requires_grad], lr,
     weight_decay=float(cfg.optim.weight_decay),
@@ -128,20 +135,47 @@ def main():
   )
 
   # --- fused back pass: per-parameter step in a grad hook, then free the grad ---
+  accum = int(cfg.optim.accum)
+  fused_backward = (accum == 1)  # fused per-param backward only works with no coexisting grads
   handles = []
-  for group in opt.param_groups:
-    for i, p in enumerate(group["params"]):
-      if not p.requires_grad:
-        continue
-      def _hook(param, g=group, idx=i):
-        if grad_clip:
-          torch.nn.utils.clip_grad_norm_(param, grad_clip)  # per-parameter clip
-        opt.step_parameter(param, g, idx)
-        param.grad = None
-      handles.append(p.register_post_accumulate_grad_hook(_hook))
-  print(f"[full] fused back pass: {len(handles)} per-parameter grad hooks", flush=True)
+  if fused_backward:
+    for group in opt.param_groups:
+      for i, p in enumerate(group["params"]):
+        if not p.requires_grad:
+          continue
+        def _hook(param, g=group, idx=i):
+          if grad_clip:
+            torch.nn.utils.clip_grad_norm_(param, grad_clip)  # per-parameter clip
+          opt.step_parameter(param, g, idx)
+          param.grad = None
+        handles.append(p.register_post_accumulate_grad_hook(_hook))
+    print(f"[full] fused back pass: {len(handles)} per-parameter grad hooks", flush=True)
+  else:
+    print(f"[full] grad-accum x{accum}: standard backward + manual SR step "
+          f"(grads coexist -> higher VRAM than accum=1)", flush=True)
 
-  schedule = get_schedule_for_resolution((res, res), known_mean=1.0)
+  def _manual_opt_step():
+    # Mirror the fused per-param hook (incl. stochastic rounding) AFTER accumulation.
+    for group in opt.param_groups:
+      for i, p in enumerate(group["params"]):
+        if p.grad is None:
+          continue
+        if grad_clip:
+          torch.nn.utils.clip_grad_norm_(p, grad_clip)
+        opt.step_parameter(p, group, i)
+        p.grad = None
+
+  blocks_to_swap = int(getattr(cfg.optim, "blocks_to_swap", 0))
+  if blocks_to_swap > 0:
+    if fused_backward:
+      print("[full] WARN: block-swap + accum==1 (fused backward) is unvalidated; "
+            "prefer accum>1", flush=True)
+    from ideogram4.block_swap import enable_block_swap
+    ns = enable_block_swap(transformer, blocks_to_swap, device)
+    print(f"[full] block-swap: {ns} deepest blocks offloaded to CPU (needs GPU smoke test)", flush=True)
+
+  schedule = get_schedule_for_resolution(
+    (res, res), known_mean=cfg.flow.schedule_mean, std=cfg.flow.schedule_std)
 
   # --- lazy cache index (filenames only; idx<n_eval held out) ---
   files = sorted(f for f in os.listdir(cache) if f.endswith(".pt"))
@@ -305,6 +339,20 @@ def main():
                                      "step": str(step_num)})
     json.dump({"step": step_num, "ckpt": os.path.basename(path)}, open(_resume_marker(ckpt), "w"))
     print(f"[full] saved {path} ({len(state)} tensors) @ step {step_num}", flush=True)
+    if save_opt:
+      # Per-param moments in opt.param_groups order (stable: optimizer rebuilt identically
+      # on resume). Moments -> CPU for a portable blob.
+      blobs = []
+      for grp in opt.param_groups:
+        for p in grp["params"]:
+          st = opt.state.get(p)
+          blobs.append(None if not st else {"step": int(st["step"]),
+                       "exp_avg": st["exp_avg"].to("cpu"),
+                       "exp_avg_sq": st["exp_avg_sq"].to("cpu")})
+      tmp = opt_path + ".tmp"
+      torch.save({"step": step_num, "blobs": blobs}, tmp)
+      os.replace(tmp, opt_path)  # atomic; single file -> only the LATEST state survives
+      print(f"[full] saved optimizer state @ step {step_num}", flush=True)
     # Each full-model bf16 ckpt is ~18.6GB: rotate the step-tagged ones (the regex
     # excludes "final"/named tags) so the disk does not fill. sorted() puts the
     # newest last; always keep the newest keep_last so the resume marker -- which
@@ -316,7 +364,7 @@ def main():
       os.remove(os.path.join(ckpt, old))
       print(f"[full] rotated out {old}", flush=True)
 
-  # --- resume (weights + step only; optimizer moments restart) ---
+  # --- resume (weights + step; optimizer moments restart unless save_optimizer is on) ---
   start_step = 0
   if cfg.paths.resume_from and os.path.exists(_resume_marker(ckpt)):
     mk = json.load(open(_resume_marker(ckpt)))
@@ -327,24 +375,55 @@ def main():
     for _ in range(start_step):
       sched_lr.step()
     print(f"[full] RESUMED weights from {mk['ckpt']} at step {start_step} (optimizer moments restart)", flush=True)
+    if save_opt and os.path.exists(opt_path):
+      # Pre-populate opt.state BEFORE the first hook fires: step_adamw_parameter inits only
+      # when len(state)==0, so restored moments are used verbatim (warm resume).
+      payload = torch.load(opt_path, map_location="cpu")
+      blobs = payload["blobs"]; bi = 0
+      for grp in opt.param_groups:
+        for p in grp["params"]:
+          b = blobs[bi]; bi += 1
+          if b is None:
+            continue
+          dev = "cpu" if offload else p.device
+          st = opt.state[p]
+          st["step"] = int(b["step"])
+          st["exp_avg"] = b["exp_avg"].to(dev)
+          st["exp_avg_sq"] = b["exp_avg_sq"].to(dev)
+      print(f"[full] RESUMED optimizer state (warm) from step {payload.get('step')}", flush=True)
+    elif save_opt:
+      print("[full] WARN save_optimizer on but no optimizer file -> COLD optimizer", flush=True)
 
   n_skipped = 0
   run, t_last = 0.0, time.time()
-  for step in range(start_step, steps):
-    b = sample_batch()
-    loss = train_edit.edit_training_step_cached_batch(
-      transformer, b, schedule=schedule, cfg_dropout_prob=cfg_drop, generator=gen,
+  def _train_step():
+    return train_edit.edit_training_step_cached_batch(
+      transformer, sample_batch(), schedule=schedule, cfg_dropout_prob=cfg_drop, generator=gen,
       timestep_shift=ts_shift, timestep_weighting=ts_weighting, min_snr_gamma=min_snr_gamma,
       masked_loss=masked, mask_quantile=mask_q, mask_bg_weight=mask_bg,
       noise_offset=noise_offset, input_perturbation=input_perturbation,
     )
-    if not is_finite_loss(loss):     # skip BEFORE backward -> no NaN update applied
-      n_skipped += 1
-      sched_lr.step()
-      continue
-    loss.backward()                  # fused hooks apply per-parameter AdamW here
-    sched_lr.step()
-    run += loss.item()
+
+  for step in range(start_step, steps):
+    if fused_backward:
+      loss = _train_step()
+      if not is_finite_loss(loss):   # skip BEFORE backward -> no NaN update applied
+        n_skipped += 1; sched_lr.step(); continue
+      loss.backward()                # fused hooks apply per-parameter AdamW here
+      sched_lr.step(); run += loss.item()
+    else:
+      acc_loss, ok = 0.0, True
+      for _ in range(accum):         # accumulate accum micro-batches, then one SR step
+        l = _train_step()
+        if not is_finite_loss(l):
+          ok = False; break
+        (l / accum).backward(); acc_loss += l.item() / accum
+      if not ok:
+        for grp in opt.param_groups:
+          for p in grp["params"]:
+            p.grad = None
+        n_skipped += 1; sched_lr.step(); continue
+      _manual_opt_step(); sched_lr.step(); run += acc_loss
 
     if (step + 1) % log_every == 0:
       dt = (time.time() - t_last) / log_every
@@ -355,6 +434,7 @@ def main():
             f"{dt:.2f}s/step peak {rec['peak_gb']:.1f}GB skipped={n_skipped}", flush=True)
       with open(metrics_path, "a") as f:
         f.write(json.dumps(rec) + "\n")
+      tracker.log(rec, rec["step"])
       run, t_last = 0.0, time.time()
       if args.smoke and step + 1 >= 30:
         print("[full] SMOKE OK -- dequant verified + steps run + VRAM measured. Exiting.", flush=True)

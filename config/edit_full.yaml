@@ -40,7 +40,9 @@ optim:
   #   CPU Adam + per-param PCIe). Recommended env: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 flow:
-  timestep_shift: 1.0    # native noise-heavy distribution (structure is set at high noise)
+  schedule_mean: 1.0     # matches the edit sampler (edit_generate mu=1.0) -> train==inference
+  schedule_std: 1.0      # sampled-t density spread
+  timestep_shift: 1.0    # extra t shift (1.0 = none); prefer schedule_mean over this
   min_snr_gamma: 5.0
 
 logging:

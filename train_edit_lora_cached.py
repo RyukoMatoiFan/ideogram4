@@ -86,6 +86,9 @@ def main():
   os.makedirs(ckpt, exist_ok=True)
   os.makedirs(output_dir, exist_ok=True)
   metrics_path = os.path.join(output_dir, "metrics.jsonl")
+  from ideogram4.trackers import Tracker
+  tracker = Tracker(cfg.logging.tracker, project=cfg.logging.wandb_project,
+                    run_name=cfg.logging.run_name or None, out_dir=output_dir)
   # Only truncate the loss log on a FRESH run. On resume (the step loop appends with
   # mode 'a'), keeping history avoids wiping the dashboard's prior metrics.
   _resume_target = f"{ckpt}/resume.pt" if cfg.paths.resume_from == "auto" else cfg.paths.resume_from
@@ -103,7 +106,8 @@ def main():
   print(f"[cached] transformer loaded in {time.time()-t0:.1f}s "
         f"(no text encoder / VAE)", flush=True)
 
-  wrapped = loramod.inject_lora(transformer, rank=rank)
+  wrapped = loramod.inject_lora(transformer, rank=rank,
+                                variant=cfg.lora.variant, target_adaln=cfg.lora.target_adaln)
   params = loramod.lora_parameters(wrapped)
   if grad_ckpt:
     transformer.gradient_checkpointing = True
@@ -121,7 +125,8 @@ def main():
     opt, scheduler=cfg.optim.lr_scheduler, warmup=warmup, total_steps=steps,
     num_restarts=int(cfg.optim.num_restarts), min_lr_ratio=float(cfg.optim.min_lr_ratio),
   )
-  schedule = get_schedule_for_resolution((res, res), known_mean=1.0)
+  schedule = get_schedule_for_resolution(
+    (res, res), known_mean=cfg.flow.schedule_mean, std=cfg.flow.schedule_std)
 
   # Lazy cache index: hold only FILENAMES (not tensors) so CPU RAM stays flat
   # regardless of dataset size -- preloading 72.7K caches is ~575GB, the full 257K
@@ -388,6 +393,7 @@ def main():
             f"peak {rec['peak_gb']:.1f}GB skipped={n_skipped}", flush=True)
       with open(metrics_path, "a") as mf:
         mf.write(json.dumps(rec) + "\n")
+      tracker.log(rec, rec["step"])
       run, t_last = 0.0, time.time()
     if (step + 1) % ckpt_every == 0:
       _save(f"step{step+1}", step + 1)

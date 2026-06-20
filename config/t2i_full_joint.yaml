@@ -1,0 +1,39 @@
+# JOINT full fine-tune of DiT + text encoder (T2I). Both are fp8 on disk -> dequant to bf16.
+# Memory: ~45-50GB GPU + ~138GB fp32 optimizer moments offloaded to host RAM (needs big RAM).
+# Effective batch = optim.accum (live-TE step is batch-1; losses summed into one fused backward).
+# WARNING: full-FT'ing the 8B text encoder risks catastrophic forgetting -> te_lr = lr/10 default.
+#   CUDA_VISIBLE_DEVICES=0 python train_t2i_full_joint_cached.py --config config/t2i_full_joint.yaml --smoke
+paths:
+  weights: ideogram-ai/ideogram-4-fp8   # HF id or local dir; real machine paths -> config/local.yaml
+  cache_dir: data/t2i/cache             # precache_t2i output (z_tgt + caption)
+  output_dir: runs/t2i-joint
+
+data:
+  resolution: 1024
+  n_eval_holdout: 0
+
+flow:
+  schedule_mean: 1.0     # for T2I tune toward your sampling preset (0.0/1.5 = V4_QUALITY_48)
+  schedule_std: 1.0
+
+optim:
+  lr: 1.0e-5             # DiT LR
+  te_lr: 0.0            # text-encoder LR; 0 -> lr/10 (forgetting safeguard)
+  optimizer_state: adafactor  # adafactor (factored, on-GPU, fast) | adamw (offloaded moments)
+  train_dit: true       # true = joint DiT+TE; false = TE-only stage (DiT frozen fp8)
+  steps: 20000
+  accum: 1              # dual-FFT is batch-1 on a single 80GB GPU (accum>1 OOMs: extra
+                        # graphs/grads on top of two 34.6GB models). For a larger effective
+                        # batch use the decoupled TE-only stage (train_dit:false, accum>1 ok)
+                        # or multi-GPU. offload_optimizer below only matters for optimizer_state: adamw.
+  warmup: 200
+  grad_clip: 1.0
+  grad_checkpointing: true
+  cfg_dropout_prob: 0.1
+  offload_optimizer: true   # fp32 moments (~138GB) in host RAM, not VRAM
+  lr_scheduler: cosine
+
+logging:
+  log_every: 10
+  ckpt_every: 1000
+  tracker: none

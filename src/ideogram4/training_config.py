@@ -52,6 +52,10 @@ class RuntimeConfig:
 class LoraConfig:
   rank: int = 64
   alpha: float | None = None
+  variant: str = "lora"        # lora | dora | loha | lokr
+  target_adaln: bool = False   # also adapt each block's adaln_modulation Linear
+  te_rank: int = 0             # TE-LoRA rank (train_te_lora_cached.py); 0 -> use rank
+  train_transformer: bool = True  # TE trainer: also LoRA the DiT (False = DiT frozen, TE-only)
 
 
 @dataclass
@@ -90,16 +94,34 @@ class OptimConfig:
   num_restarts: int = 1            # cycles for cosine_restarts
   prior_preservation_weight: float = 0.0  # keep background near the frozen base (anti-forgetting)
   offload_optimizer: bool = False  # full-FT: keep Adam moments in CPU RAM (~21GB VRAM vs ~58GB)
+  blocks_to_swap: int = 0          # full-FT: offload N deepest blocks to CPU, swap in/out
+                                   # per forward/backward (lower VRAM; use with accum>1)
   anchor_weight: float = 1.0       # uncond LoRA: weight of the no-op-on-clean regularizer
                                    # (disentangles the degradation axis from dataset content)
   weight_decay: float = 0.01       # full-FT AdamW weight decay (train_edit_full_cached.py)
+  te_lr: float = 0.0               # joint full-FT: separate (lower) LR for the text encoder;
+                                   # 0 -> lr/10 when training the DiT too, else lr (TE-only stage)
+  train_dit: bool = True           # joint trainer: also full-FT the DiT. False = DiT stays
+                                   # frozen fp8, ONLY the text encoder trains (decoupled stage 1)
+  optimizer_state: str = "adamw"   # joint full-FT moment backend: adamw (offload) | adafactor (on-GPU)
   preload_caches: bool = True      # full-FT trainers: preload latent caches into RAM
 
 
 @dataclass
 class FlowConfig:
-  timestep_shift: float = 1.0          # flux-style shift on sampled t (1.0 = none)
-  timestep_weighting: str = "uniform"  # uniform | bell | min_snr
+  # Logit-normal density the training timestep t is sampled from (center/spread before
+  # the automatic per-image-area resolution shift). Default 1.0/1.0 reproduces the
+  # original hardcoded behaviour AND exactly matches the edit sampler (edit_generate
+  # defaults mu=1.0, std=1.0) -- so edit trainers are calibrated to their inference by
+  # default. For text-to-image, tune toward the sampling preset you generate with
+  # (e.g. schedule_mean: 0.0, schedule_std: 1.5 to match V4_QUALITY_48; the T2I pipeline
+  # default is mu=0.5, std=1.0). This is a soft calibration knob, not a correctness
+  # requirement: the flow convention itself matches train<->inference at any value.
+  schedule_mean: float = 1.0
+  schedule_std: float = 1.0
+  timestep_shift: float = 1.0          # extra monotonic shift on sampled t (1.0 = none);
+                                       # redundant with schedule_mean -- prefer one or the other
+  timestep_weighting: str = "uniform"  # uniform | bell | min_snr | sigma_sqrt | cosmap
   min_snr_gamma: float = 5.0
   noise_offset: float = 0.0            # per-channel constant added to the sampled noise
   input_perturbation: float = 0.0      # extra noise on x_t only (target stays clean)
@@ -150,6 +172,9 @@ class LoggingConfig:
   sample_guidance: float = 2.0
   sample_count: int = 4       # how many prompts/items to sample each time
   preview_dir: str = ""       # dir of curated preview_*.pt (llm_text only) -> T2I-only dashboard
+  tracker: str = "none"       # none | wandb | tensorboard (mirrors metrics.jsonl scalars)
+  wandb_project: str = "ideogram4"
+  run_name: str = ""          # tracker run name ("" -> backend default)
 
 
 @dataclass

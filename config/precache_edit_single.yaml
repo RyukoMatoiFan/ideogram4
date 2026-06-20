@@ -1,0 +1,20 @@
+# Precache the consolidated SINGLE-reference edit dataset (Pico + vins/nano-consistent).
+# Layout (verified): meta.jsonl at root {idx, text}, train/NNNNNN_src.jpg + _tgt.jpg.
+# 279,929 verified pairs (every image full-decoded; empty/corrupt rows dropped).
+#
+# Run on the server (encoders-only pipeline, ~11GB VRAM -> fits the free GPU):
+#   CUDA_VISIBLE_DEVICES=3 conda run --no-capture-output -n ig4 \
+#     python precache_edit.py --config config/precache_edit_single.yaml
+# Parallel across GPUs: add --num-shards N --shard K (one process per GPU).
+paths:
+  weights: ideogram-ai/ideogram-4-fp8   # HF id or local dir; real machine paths -> config/local.yaml
+  data_root: data/edit-single           # consolidated single-ref dataset (meta.jsonl + train/)
+  cache_dir: data/edit-single/cache
+
+data:
+  resolution: 1024          # bake square 1024; flip aspect_bucketing on for native AR
+  img_ext: jpg
+  instr_field: text
+  meta_at_root: true
+  # aspect_bucketing: true
+  # bucket_pixels: 1048576

@@ -69,6 +69,9 @@ def main():
   os.makedirs(ckpt, exist_ok=True); os.makedirs(output_dir, exist_ok=True)
   sample_dir = os.path.join(output_dir, "samples")
   metrics_path = os.path.join(output_dir, "metrics.jsonl")
+  from ideogram4.trackers import Tracker
+  tracker = Tracker(cfg.logging.tracker, project=cfg.logging.wandb_project,
+                    run_name=cfg.logging.run_name or None, out_dir=output_dir)
   if not (cfg.paths.resume_from and os.path.exists(_marker(ckpt))):
     open(metrics_path, "w").close()
 
@@ -87,26 +90,59 @@ def main():
 
   _sr_seed(cfg.runtime.seed, device)
   offload = bool(cfg.optim.offload_optimizer)
+  # Opt-in (DEFAULT OFF -> behaviour bit-identical when absent): persist AdamW moments so a
+  # restart is a WARM resume (no Adam re-warmup transient). Single file, overwritten each
+  # ckpt -> only the LATEST optimizer state is ever kept (moments are ~4x the bf16 weights;
+  # one matching snapshot is all a resume can use).
+  save_opt = bool(getattr(cfg.optim, "save_optimizer", False))
+  opt_path = f"{ckpt}/t2i_full_optimizer.pt"
   opt = build_fused_adamw([p for p in transformer.parameters() if p.requires_grad], lr,
                           stochastic_rounding=True, offload_states=offload)
   print(f"[t2i-full] fused AdamW + SR | states {'CPU(offload)' if offload else 'GPU'}", flush=True)
   sched_lr = build_lr_scheduler(opt, scheduler=cfg.optim.lr_scheduler, warmup=warmup,
                                 total_steps=steps, num_restarts=int(cfg.optim.num_restarts),
                                 min_lr_ratio=float(cfg.optim.min_lr_ratio))
+  accum = int(cfg.optim.accum)
+  fused_backward = (accum == 1)  # fused per-param backward only works with no coexisting grads
   handles = []
-  for group in opt.param_groups:
-    for i, p in enumerate(group["params"]):
-      if not p.requires_grad:
-        continue
-      def _hook(param, g=group, idx=i):
-        if grad_clip:
-          torch.nn.utils.clip_grad_norm_(param, grad_clip)
-        opt.step_parameter(param, g, idx)
-        param.grad = None
-      handles.append(p.register_post_accumulate_grad_hook(_hook))
-  print(f"[t2i-full] fused back pass: {len(handles)} hooks", flush=True)
+  if fused_backward:
+    for group in opt.param_groups:
+      for i, p in enumerate(group["params"]):
+        if not p.requires_grad:
+          continue
+        def _hook(param, g=group, idx=i):
+          if grad_clip:
+            torch.nn.utils.clip_grad_norm_(param, grad_clip)
+          opt.step_parameter(param, g, idx)
+          param.grad = None
+        handles.append(p.register_post_accumulate_grad_hook(_hook))
+    print(f"[t2i-full] fused back pass: {len(handles)} hooks", flush=True)
+  else:
+    print(f"[t2i-full] grad-accum x{accum}: standard backward + manual SR step "
+          f"(grads coexist -> higher VRAM than accum=1)", flush=True)
 
-  schedule = get_schedule_for_resolution((res, res), known_mean=1.0)
+  def _manual_opt_step():
+    # Mirror the fused per-param hook (incl. stochastic rounding) AFTER accumulation.
+    for group in opt.param_groups:
+      for i, p in enumerate(group["params"]):
+        if p.grad is None:
+          continue
+        if grad_clip:
+          torch.nn.utils.clip_grad_norm_(p, grad_clip)
+        opt.step_parameter(p, group, i)
+        p.grad = None
+
+  blocks_to_swap = int(getattr(cfg.optim, "blocks_to_swap", 0))
+  if blocks_to_swap > 0:
+    if fused_backward:
+      print("[t2i-full] WARN: block-swap + accum==1 (fused backward) is unvalidated; "
+            "prefer accum>1", flush=True)
+    from ideogram4.block_swap import enable_block_swap
+    ns = enable_block_swap(transformer, blocks_to_swap, device)
+    print(f"[t2i-full] block-swap: {ns} deepest blocks offloaded to CPU (needs GPU smoke test)", flush=True)
+
+  schedule = get_schedule_for_resolution(
+    (res, res), known_mean=cfg.flow.schedule_mean, std=cfg.flow.schedule_std)
 
   files = sorted(f for f in os.listdir(cache) if f.endswith(".pt"))
   eval_files = [f for f in files if int(f[:-3]) < n_eval]
@@ -324,6 +360,20 @@ def main():
     save_file(state, path, metadata={"base_model": weights, "type": "ideogram4-t2i-full", "step": str(step_num)})
     json.dump({"step": step_num, "ckpt": os.path.basename(path)}, open(_marker(ckpt), "w"))
     print(f"[t2i-full] saved {path} @ {step_num}", flush=True)
+    if save_opt:
+      # Per-param moments aligned to opt.param_groups order (stable: optimizer is rebuilt
+      # identically on resume). Moments -> CPU for a portable, device-agnostic blob.
+      blobs = []
+      for grp in opt.param_groups:
+        for p in grp["params"]:
+          st = opt.state.get(p)
+          blobs.append(None if not st else {"step": int(st["step"]),
+                       "exp_avg": st["exp_avg"].to("cpu"),
+                       "exp_avg_sq": st["exp_avg_sq"].to("cpu")})
+      tmp = opt_path + ".tmp"
+      torch.save({"step": step_num, "blobs": blobs}, tmp)
+      os.replace(tmp, opt_path)  # atomic; single file -> only the LATEST state survives
+      print(f"[t2i-full] saved optimizer state @ {step_num}", flush=True)
     # Full-model bf16 ckpts are ~19GB: rotate step-tagged ones (never "final"/named tags)
     import re as _re
     stepped = sorted(f for f in os.listdir(ckpt)
@@ -341,17 +391,52 @@ def main():
     for _ in range(start_step):
       sched_lr.step()
     print(f"[t2i-full] RESUMED at step {start_step}", flush=True)
+    if save_opt and os.path.exists(opt_path):
+      # Pre-populate opt.state BEFORE the first hook fires: step_adamw_parameter inits only
+      # when len(state)==0, so restored moments are used verbatim (warm resume).
+      payload = torch.load(opt_path, map_location="cpu")
+      blobs = payload["blobs"]; bi = 0
+      for grp in opt.param_groups:
+        for p in grp["params"]:
+          b = blobs[bi]; bi += 1
+          if b is None:
+            continue
+          dev = "cpu" if offload else p.device
+          st = opt.state[p]
+          st["step"] = int(b["step"])
+          st["exp_avg"] = b["exp_avg"].to(dev)
+          st["exp_avg_sq"] = b["exp_avg_sq"].to(dev)
+      print(f"[t2i-full] RESUMED optimizer state (warm) from step {payload.get('step')}", flush=True)
+    elif save_opt:
+      print("[t2i-full] WARN save_optimizer on but no optimizer file -> COLD optimizer", flush=True)
 
   os.makedirs(sample_dir, exist_ok=True)
-  n_skipped = 0; run, t_last = 0.0, time.time()
-  for step in range(start_step, steps):
-    loss = train_t2i.t2i_training_step_cached_batch(
+  def _train_step():
+    return train_t2i.t2i_training_step_cached_batch(
       transformer, sample_batch(), schedule=schedule, cfg_dropout_prob=cfg_drop, generator=gen,
       timestep_shift=ts_shift, timestep_weighting=ts_weighting, min_snr_gamma=min_snr_gamma,
       noise_offset=noise_offset)
-    if not is_finite_loss(loss):
-      n_skipped += 1; sched_lr.step(); continue
-    loss.backward(); sched_lr.step(); run += loss.item()
+
+  n_skipped = 0; run, t_last = 0.0, time.time()
+  for step in range(start_step, steps):
+    if fused_backward:
+      loss = _train_step()
+      if not is_finite_loss(loss):
+        n_skipped += 1; sched_lr.step(); continue
+      loss.backward(); sched_lr.step(); run += loss.item()
+    else:
+      acc_loss, ok = 0.0, True
+      for _ in range(accum):  # accumulate accum micro-batches, then one SR step
+        l = _train_step()
+        if not is_finite_loss(l):
+          ok = False; break
+        (l / accum).backward(); acc_loss += l.item() / accum
+      if not ok:
+        for grp in opt.param_groups:
+          for p in grp["params"]:
+            p.grad = None
+        n_skipped += 1; sched_lr.step(); continue
+      _manual_opt_step(); sched_lr.step(); run += acc_loss
 
     if (step + 1) % log_every == 0:
       dt = (time.time() - t_last) / log_every
@@ -364,6 +449,7 @@ def main():
             f"{dt:.2f}s/step peak {rec['peak_gb']:.1f}GB", flush=True)
       with open(metrics_path, "a") as f:
         f.write(json.dumps(rec) + "\n")
+      tracker.log(rec, rec["step"])
       run, t_last = 0.0, time.time()
       if args.smoke and step + 1 >= 30:
         print("[t2i-full] SMOKE OK", flush=True); return

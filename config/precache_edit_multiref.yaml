@@ -1,0 +1,17 @@
+# Precache the consolidated MULTI-reference edit dataset (Echo-4o).
+# Layout (verified): train/meta.jsonl {idx, instruction, refs[], target},
+# train/NNNNNN_ref0.jpg.. + NNNNNN_tgt.jpg. 69,448 verified samples
+# (refs per sample: 2->29066, 3->30348, 4->10034; empty/corrupt rows dropped).
+#
+# Run on the server (encoders-only pipeline, ~11GB VRAM):
+#   CUDA_VISIBLE_DEVICES=3 conda run --no-capture-output -n ig4 \
+#     python precache_multiref.py --config config/precache_edit_multiref.yaml
+# Parallel across GPUs: add --num-shards N --shard K.
+paths:
+  weights: ideogram-ai/ideogram-4-fp8   # HF id or local dir; real machine paths -> config/local.yaml
+  data_root: data/edit-multiref         # consolidated multi-ref dataset (train/meta.jsonl + refs/target)
+  cache_dir: data/edit-multiref/cache
+
+data:
+  resolution: 1024
+  instr_field: instruction
