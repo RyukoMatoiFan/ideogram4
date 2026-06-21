@@ -35,7 +35,9 @@ class PathsConfig:
   output_dir: str = "runs"
   ckpt_dir: str = ""         # "" -> f"{output_dir}/ckpts"
   results_dir: str = ""
-  resume_from: str = ""      # path to resume.pt; "auto" = {ckpt_dir}/resume.pt if present
+  resume_from: str = ""      # crash recovery: "auto" = resume the same run from {ckpt_dir} marker
+  init_dit: str = ""         # load these bf16 DiT weights at start (step 0) -- QAT finishing pass
+  init_te: str = ""          # load these bf16 text-encoder weights at start (step 0)
 
 
 @dataclass
@@ -105,6 +107,10 @@ class OptimConfig:
                                    # frozen fp8, ONLY the text encoder trains (decoupled stage 1)
   optimizer_state: str = "adamw"   # joint full-FT moment backend: adamw (offload) | adafactor (on-GPU)
   preload_caches: bool = True      # full-FT trainers: preload latent caches into RAM
+  fp8_qat: bool = False            # joint full-FT: fake-quantize the former-fp8 Linears in the
+                                   # forward (STE) so weights train against the exact export rounding
+  qat_stochastic: bool = False     # QAT/export rounding: False = RTN (cheap, deterministic, model
+                                   # adapts to it) | True = stochastic (must match the exporter)
 
 
 @dataclass

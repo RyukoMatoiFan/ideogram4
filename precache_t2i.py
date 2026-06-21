@@ -8,7 +8,7 @@ Ideogram-4 is native to STRUCTURED JSON captions (bbox schema); plain prose/tags
 OOD, so each caption is wrapped in the JSON schema. Video-prompt cruft (LTX-2 / camera /
 sound sentences) is stripped so only the visual description conditions the image.
 
-  python precache_t2i.py --config config/precache_t2i.yaml --img-dir /path/to/anime
+  python precache_t2i.py --config <your-config>.yaml --img-dir /path/to/images
 """
 import argparse
 import glob
@@ -38,7 +38,7 @@ def clean_caption(text: str) -> str:
 
 
 def to_json_caption(text: str) -> str:
-  """Wrap a danbooru tag string in the verifier-compliant ig4 JSON schema.
+  """Wrap a plain tag/caption string in the verifier-compliant ig4 JSON schema.
 
   medium signaled natively in HLD; tags live in the element ``desc`` (the schema's home
   for granular attributes); optional fields (bbox / style_description / aspect_ratio) are
@@ -46,7 +46,7 @@ def to_json_caption(text: str) -> str:
   the field). ``type`` must be ``obj`` (not ``subject``). ``background`` is required by the
   schema so it stays as an empty string. MUST match the inference-time wrapper exactly."""
   caption = {
-    "high_level_description": "an anime illustration",
+    "high_level_description": "an illustration",
     "compositional_deconstruction": {
       "background": "",
       "elements": [{"type": "obj", "desc": text}],
@@ -60,12 +60,17 @@ def main():
   ap = argparse.ArgumentParser(description="Precache T2I VAE latents + text features.")
   ap.add_argument("--config", default="config/precache_t2i.yaml")
   ap.add_argument("--img-dir", required=True, help="folder of <name>.<ext> + <name>.txt (recursive)")
-  ap.add_argument("--img-ext", default="png")
+  ap.add_argument("--img-ext", default="png", help="image extension(s); comma-separated for a mixed "
+                  "corpus, e.g. jpg,png,jpeg,webp")
   ap.add_argument("--num-shards", type=int, default=1, help="split across N parallel processes (one GPU each)")
   ap.add_argument("--shard", type=int, default=0, help="this process's shard id in [0, num_shards)")
   ap.add_argument("--raw-caption", action="store_true", help="skip prose cleaning (for tag captions)")
+  ap.add_argument("--prebuilt-json", action="store_true", help="read a per-image <name>.json caption "
+                  "verbatim (built by an external caption builder) instead of wrapping the .txt")
   ap.add_argument("--te-ckpt", default="", help="re-precache with a fine-tuned text encoder "
                   "(decoupled: TE stage -> re-precache -> fast cached DiT full-FT)")
+  ap.add_argument("--no-llm-text", action="store_true", help="skip the per-image text-encoder forward "
+                  "and omit llm_text (joint live-TE trainer re-encodes from `caption` -> faster, smaller)")
   args = ap.parse_args()
   num_shards = max(1, int(args.num_shards)); shard_id = int(args.shard) % num_shards
 
@@ -98,7 +103,10 @@ def main():
                              num=int(cfg.data.num_buckets))
     print(f"[precache-t2i] aspect bucketing ON: {len(buckets)} buckets {buckets}", flush=True)
 
-  imgs = sorted(glob.glob(os.path.join(args.img_dir, f"**/*.{args.img_ext}"), recursive=True))
+  _exts = [e.strip().lstrip(".") for e in args.img_ext.split(",") if e.strip()]
+  imgs = sorted(p for e in _exts for p in glob.glob(os.path.join(args.img_dir, f"**/*.{e}"), recursive=True))
+  if not imgs:  # wrong/single ext on a mixed corpus would silently cache a subset -> hard-fail on zero
+    raise SystemExit(f"[precache-t2i] no images ({args.img_ext}) under {args.img_dir} -- check --img-ext")
   print(f"[precache-t2i] {len(imgs)} images "
         f"{'(bucketed)' if aspect_bucketing else f'@ {res}px'} | shard {shard_id}/{num_shards}", flush=True)
 
@@ -139,9 +147,16 @@ def main():
     out_path = f"{cache}/{idx:06d}.pt"
     if os.path.exists(out_path):
       continue
-    cap_path = os.path.splitext(ip)[0] + ".txt"
-    raw = open(cap_path, encoding="utf-8", errors="ignore").read() if os.path.exists(cap_path) else ""
-    caption = to_json_caption(raw.strip() if args.raw_caption else clean_caption(raw))
+    if args.prebuilt_json:  # read the mixed tag+NL caption verbatim (train==inference shape)
+      json_path = os.path.splitext(ip)[0] + ".json"
+      if not os.path.exists(json_path):
+        print(f"[precache-t2i] WARN no prebuilt json for {rel}; skipping", flush=True)
+        continue  # skip rather than silently fall back -> never mix two caption shapes in one cache
+      caption = open(json_path, encoding="utf-8").read().strip()
+    else:
+      cap_path = os.path.splitext(ip)[0] + ".txt"
+      raw = open(cap_path, encoding="utf-8", errors="ignore").read() if os.path.exists(cap_path) else ""
+      caption = to_json_caption(raw.strip() if args.raw_caption else clean_caption(raw))
     img = Image.open(ip).convert("RGB")
     if aspect_bucketing:
       H, W = nearest_bucket(img.width, img.height, buckets)
@@ -150,15 +165,18 @@ def main():
     gh, gw = H // patch, W // patch
     x = train_edit.images_to_tensor([img], H, W, pipe.device)
     z_tgt = train_edit.encode_image_tokens(pipe, x, patch_size=ps)[0]
-    inputs = train_edit.build_edit_inputs(pipe, [caption], gh, gw)
-    llm = pipe._encode_text(inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"])
-    mask = inputs["indicator"][0] == LLM_TOKEN_INDICATOR
-    llm_text = llm[0][mask]
-    _atomic_save({
-      "z_tgt": z_tgt.to(torch.bfloat16).cpu(),
-      "llm_text": llm_text.to(torch.bfloat16).cpu(),
-      "grid_h": gh, "grid_w": gw, "idx": idx, "caption": caption,
-    }, out_path)
+    save_obj = {"z_tgt": z_tgt.to(torch.bfloat16).cpu(),
+                "grid_h": gh, "grid_w": gw, "idx": idx, "caption": caption}
+    if not args.no_llm_text:  # joint live-TE trainer ignores llm_text -> skip the per-image TE forward
+      try:
+        inputs = train_edit.build_edit_inputs(pipe, [caption], gh, gw)
+        llm = pipe._encode_text(inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"])
+        mask = inputs["indicator"][0] == LLM_TOKEN_INDICATOR
+        save_obj["llm_text"] = llm[0][mask].to(torch.bfloat16).cpu()
+      except Exception as e:  # e.g. caption > max_text_tokens -> skip this one, don't abort the run
+        print(f"[precache-t2i] WARN skip {rel} (encode failed: {str(e)[:120]})", flush=True)
+        continue
+    _atomic_save(save_obj, out_path)
     if (pos + 1) % 20 == 0:
       print(f"[precache-t2i] {pos+1}/{len(imgs)} ({(time.time()-t0)/(pos+1):.2f}s/img)", flush=True)
   print(f"[precache-t2i] DONE: {len(imgs)} images -> {cache}", flush=True)

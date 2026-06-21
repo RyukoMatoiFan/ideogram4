@@ -25,6 +25,87 @@ FP8_SCALE_SUFFIX = ".weight_scale"
 FP8_TEXT_ENCODER_CONFIG_FLAG = "ideogram_fp8_weight_only"
 
 
+def _e4m3_positive_grid(device: torch.device) -> torch.Tensor:
+  """Sorted finite non-negative magnitudes representable in e4m3 (float8_e4m3fn).
+  Used to round onto the EXACT grid for stochastic rounding."""
+  codes = torch.arange(256, dtype=torch.uint8, device=device)
+  vals = codes.view(FP8_WEIGHT_DTYPE).to(torch.float32)
+  return torch.unique(vals[torch.isfinite(vals)].abs())  # ascending, includes 0.0
+
+
+def _stochastic_round_to_e4m3(q: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+  """Round q (already scaled into the e4m3 range) onto the e4m3 grid with STOCHASTIC
+  rounding: round up to the upper grid neighbour with probability == fractional distance,
+  so E[round(q)] == q (unbiased). Returns a float8_e4m3fn tensor."""
+  grid = _e4m3_positive_grid(q.device)
+  sign = torch.sign(q)
+  aq = q.abs().clamp(max=FP8_E4M3_MAX)
+  idx = torch.searchsorted(grid, aq)                          # first grid value >= aq
+  hi = grid[idx.clamp(max=grid.numel() - 1)]
+  lo = grid[(idx - 1).clamp(min=0)]
+  span = (hi - lo).clamp_min(torch.finfo(torch.float32).tiny)
+  p_up = ((aq - lo) / span).clamp(0.0, 1.0)                   # P(round to hi); 1.0 when aq on grid
+  u = torch.rand(aq.shape, device=q.device, generator=generator)
+  return (sign * torch.where(u < p_up, hi, lo)).to(FP8_WEIGHT_DTYPE)
+
+
+def quantize_to_fp8(
+  weight: torch.Tensor, *, stochastic: bool = True, generator: torch.Generator | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Inverse of the ``Fp8Linear`` dequant: quantize a bf16/f32 Linear weight ``[out, in]``
+  to per-output-row symmetric e4m3. Returns ``(weight_fp8 [out,in] float8_e4m3fn,
+  weight_scale [out] float32)`` such that ``weight_fp8.to(f32) * weight_scale[:, None]``
+  reconstructs ``weight`` (matches ``dequantize_fp8_transformer`` / ``Fp8Linear.forward``).
+
+  ``stochastic=True`` rounds onto the e4m3 grid with stochastic rounding (unbiased -> removes
+  the correlated round-to-nearest bias that does NOT average out across a GEMM); ``False`` = RTN.
+  Scales are recomputed from THIS weight's per-row absmax (never reuse pre-training scales).
+  """
+  w = weight.detach().to(torch.float32)
+  scale = (w.abs().amax(dim=1) / FP8_E4M3_MAX).clamp_min(1e-8)   # [out]
+  q = w / scale.unsqueeze(1)
+  if stochastic:
+    w_fp8 = _stochastic_round_to_e4m3(q, generator)
+  else:
+    w_fp8 = q.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(FP8_WEIGHT_DTYPE)
+  return w_fp8, scale
+
+
+def fake_quantize_fp8(
+  weight: torch.Tensor, *, stochastic: bool = False, generator: torch.Generator | None = None
+) -> torch.Tensor:
+  """Straight-through fp8 fake-quantization for QAT (quantization-aware training).
+
+  Forward returns ``dequant(quantize(weight))`` so the model sees EXACTLY the deployed fp8
+  rounding; backward is identity to ``weight`` (straight-through estimator), so the bf16 master
+  weight still receives real gradients. The forward MUST stay bit-identical to the exporter --
+  it reuses ``quantize_to_fp8`` -- otherwise the QAT/inference (sim-deploy) gap reopens. Default
+  ``stochastic=False`` (RTN): the model adapts to the deterministic deployed rounding, so export
+  with the same RTN. Apply only to layers that will be exported fp8 (same keep-list as export).
+  """
+  wq, scale = quantize_to_fp8(weight, stochastic=stochastic, generator=generator)
+  deq = (wq.to(torch.float32) * scale.unsqueeze(1)).to(weight.dtype)
+  return weight + (deq - weight).detach()  # STE: forward=quantized, grad flows to weight
+
+
+class QATFp8Linear(nn.Module):
+  """Fake-quantized Linear for QAT: keeps a trainable bf16 MASTER weight, but the forward uses
+  ``fake_quantize_fp8(weight)`` (straight-through) so the model trains against the EXACT fp8
+  rounding it will be exported with -- closing the post-training quantization gap. State-dict keys
+  match ``nn.Linear`` (``weight``/``bias``) so a bf16 checkpoint loads into it and ``state_dict()``
+  writes the bf16 master. ``stochastic`` MUST match the exporter (RTN by default)."""
+
+  def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None, *, stochastic: bool = False):
+    super().__init__()
+    self.weight = nn.Parameter(weight)
+    self.bias = nn.Parameter(bias) if bias is not None else None
+    self.stochastic = stochastic
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    w = fake_quantize_fp8(self.weight, stochastic=self.stochastic)
+    return F.linear(x, w.to(x.dtype), self.bias)
+
+
 def is_bnb4bit_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
   """True if any key looks like a bnb 4-bit quant_state sibling."""
   return any(".quant_state.bitsandbytes__" in k for k in state_dict)

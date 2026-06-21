@@ -832,7 +832,8 @@ def expand_reference_embedding(transformer: nn.Module) -> nn.Module:
 
 
 def dequantize_fp8_transformer(
-  transformer: nn.Module, *, dtype: torch.dtype = torch.bfloat16
+  transformer: nn.Module, *, dtype: torch.dtype = torch.bfloat16,
+  qat: bool = False, qat_stochastic: bool = False,
 ) -> nn.Module:
   """Replace ``Fp8Linear`` layers with trainable ``nn.Linear`` for full-rank FT.
 
@@ -844,20 +845,33 @@ def dequantize_fp8_transformer(
   you are finetuning from a slightly degraded starting point. For most finetuning
   that is acceptable; if you need the full quality ceiling, prefer LoRA/DoRA on the
   frozen fp8 base (no dequantization) or wait for official bf16 weights. In-place.
+
+  ``qat=True`` instead wraps each former-``Fp8Linear`` in a ``QATFp8Linear`` (trainable bf16
+  master + straight-through fp8 fake-quant in the forward), so the model trains against the
+  exact export rounding (quantization-aware finishing pass). The wrapped set == the base's fp8
+  set == the export set, so QAT and export stay consistent by construction. ``qat_stochastic``
+  must match the exporter (RTN by default).
   """
-  from ideogram4.quantized_loading import Fp8Linear
+  from ideogram4.quantized_loading import Fp8Linear, QATFp8Linear
 
   for name, child in list(transformer.named_children()):
     if isinstance(child, Fp8Linear):
-      lin = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
-      with torch.no_grad():
-        w = child.weight.to(torch.float32) * child.weight_scale.to(torch.float32).unsqueeze(1)
-        lin.weight.copy_(w)
-        if child.bias is not None:
-          lin.bias.copy_(child.bias.to(torch.float32))
-      setattr(transformer, name, lin.to(child.weight.device, dtype))
+      if qat:
+        with torch.no_grad():
+          w = (child.weight.to(torch.float32) * child.weight_scale.to(torch.float32).unsqueeze(1)).to(dtype)
+          b = child.bias.detach().to(dtype) if child.bias is not None else None
+        mod = QATFp8Linear(w, b, stochastic=qat_stochastic).to(child.weight.device)
+      else:
+        lin = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
+        with torch.no_grad():
+          w = child.weight.to(torch.float32) * child.weight_scale.to(torch.float32).unsqueeze(1)
+          lin.weight.copy_(w)
+          if child.bias is not None:
+            lin.bias.copy_(child.bias.to(torch.float32))
+        mod = lin.to(child.weight.device, dtype)
+      setattr(transformer, name, mod)
     else:
-      dequantize_fp8_transformer(child, dtype=dtype)
+      dequantize_fp8_transformer(child, dtype=dtype, qat=qat, qat_stochastic=qat_stochastic)
   return transformer
 
 
