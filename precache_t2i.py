@@ -60,8 +60,9 @@ def main():
   ap = argparse.ArgumentParser(description="Precache T2I VAE latents + text features.")
   ap.add_argument("--config", default="config/precache_t2i.yaml")
   ap.add_argument("--img-dir", required=True, help="folder of <name>.<ext> + <name>.txt (recursive)")
-  ap.add_argument("--img-ext", default="png", help="image extension(s); comma-separated for a mixed "
-                  "corpus, e.g. jpg,png,jpeg,webp")
+  ap.add_argument("--img-ext", default="jpg,png,jpeg,webp", help="image extension(s); comma-separated "
+                  "for a mixed corpus. Default globs all common types so a single-ext-per-source "
+                  "corpus is never silently half-cached; pass one ext to restrict.")
   ap.add_argument("--num-shards", type=int, default=1, help="split across N parallel processes (one GPU each)")
   ap.add_argument("--shard", type=int, default=0, help="this process's shard id in [0, num_shards)")
   ap.add_argument("--raw-caption", action="store_true", help="skip prose cleaning (for tag captions)")
@@ -110,6 +111,26 @@ def main():
   print(f"[precache-t2i] {len(imgs)} images "
         f"{'(bucketed)' if aspect_bucketing else f'@ {res}px'} | shard {shard_id}/{num_shards}", flush=True)
 
+  # Coarse source guard: a different --img-dir PATH (or a --prebuilt-json / --raw-caption mode flip)
+  # assigns DIFFERENT rel names, so the manifest appends NEW idx and the old eval holdout idx 0..n_eval
+  # would survive from the previous dataset -- fail closed on that. (A select_subset re-pick onto the
+  # SAME --out keeps the rel names but repoints them at different images; that is caught per-file by
+  # the content-aware skip in the loop, not here.) Image COUNT may grow: incremental add is allowed.
+  # Safest is still a fresh cache_dir per distinct pick (orphan .pt from a SMALLER re-pick linger).
+  sig = {"img_dir": os.path.abspath(args.img_dir),
+         "prebuilt_json": bool(args.prebuilt_json), "raw_caption": bool(args.raw_caption)}
+  sig_path = os.path.join(cache, "precache_source.json")
+  if os.path.exists(sig_path):
+    with open(sig_path, encoding="utf-8") as f:
+      old_sig = json.load(f)
+    if {k: old_sig.get(k) for k in sig} != sig:
+      raise SystemExit(f"[precache-t2i] cache_dir {cache} was built from a different source/mode "
+                       f"({old_sig}) than this run ({sig}); use a fresh --config cache_dir or clear it")
+  elif shard_id == 0:
+    with open(sig_path + ".tmp", "w", encoding="utf-8") as f:
+      json.dump(sig, f, ensure_ascii=False)
+    os.replace(sig_path + ".tmp", sig_path)
+
   def _atomic_save(obj, out):
     torch.save(obj, out + ".tmp")  # never leave a truncated .pt behind a crash:
     os.replace(out + ".tmp", out)  # exists()-skip resume would treat it as done
@@ -132,7 +153,9 @@ def main():
     if rel not in path2idx:
       path2idx[rel] = next_idx
       next_idx += 1
-  # Only the shard owner rewrites (shard 0); avoids concurrent clobber across processes.
+  # Only the shard owner rewrites (shard 0); avoids concurrent clobber across processes. Caveat:
+  # if the image set changes later, re-run a pass that INCLUDES shard 0 so new path->idx entries are
+  # persisted (other shards derive idx from the same sorted glob but never write the manifest).
   if shard_id == 0:
     tmp = manifest_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -140,13 +163,32 @@ def main():
     os.replace(tmp, manifest_path)
 
   t0 = time.time()
+  n_owned = n_written = n_exists = 0  # H6: hard-fail if a shard owns rows but writes/has nothing
   for pos, (ip, rel) in enumerate(zip(imgs, rels)):
     idx = path2idx[rel]
     if num_shards > 1 and (idx % num_shards) != shard_id:
       continue  # another shard owns this row (global idx -> no collision)
+    n_owned += 1
     out_path = f"{cache}/{idx:06d}.pt"
+    cur_src = os.path.realpath(ip)  # follow select_subset's symlink to the real source image
     if os.path.exists(out_path):
-      continue
+      # Content-aware skip: a bare exists() check would serve a STALE {idx}.pt after select_subset
+      # re-picks a different source image onto the same NNNNNN name. Re-encode when the cached source
+      # image changed (or, for prebuilt, the caption changed); legacy caches without a 'src' field are
+      # trusted (skip) so this never forces a needless full re-precache of an existing cache.
+      try:
+        prev = torch.load(out_path, map_location="cpu", mmap=True)
+        fresh = ("src" not in prev) or (prev.get("src") == cur_src)
+        if fresh and args.prebuilt_json:
+          jp = os.path.splitext(ip)[0] + ".json"
+          if os.path.exists(jp):
+            fresh = (str(prev.get("caption", "")) == open(jp, encoding="utf-8").read().strip())
+        del prev
+      except Exception:
+        fresh = False
+      if fresh:
+        n_exists += 1
+        continue  # else: source/caption at this idx changed -> fall through and re-encode (self-heal)
     if args.prebuilt_json:  # read the mixed tag+NL caption verbatim (train==inference shape)
       json_path = os.path.splitext(ip)[0] + ".json"
       if not os.path.exists(json_path):
@@ -166,7 +208,7 @@ def main():
     x = train_edit.images_to_tensor([img], H, W, pipe.device)
     z_tgt = train_edit.encode_image_tokens(pipe, x, patch_size=ps)[0]
     save_obj = {"z_tgt": z_tgt.to(torch.bfloat16).cpu(),
-                "grid_h": gh, "grid_w": gw, "idx": idx, "caption": caption}
+                "grid_h": gh, "grid_w": gw, "idx": idx, "caption": caption, "src": cur_src}
     if not args.no_llm_text:  # joint live-TE trainer ignores llm_text -> skip the per-image TE forward
       try:
         inputs = train_edit.build_edit_inputs(pipe, [caption], gh, gw)
@@ -177,9 +219,17 @@ def main():
         print(f"[precache-t2i] WARN skip {rel} (encode failed: {str(e)[:120]})", flush=True)
         continue
     _atomic_save(save_obj, out_path)
+    n_written += 1
     if (pos + 1) % 20 == 0:
       print(f"[precache-t2i] {pos+1}/{len(imgs)} ({(time.time()-t0)/(pos+1):.2f}s/img)", flush=True)
-  print(f"[precache-t2i] DONE: {len(imgs)} images -> {cache}", flush=True)
+  # Wrong pipeline order (e.g. build_anime_captions never ran on this subset, so no <name>.json)
+  # would otherwise print DONE on an EMPTY cache; fail loudly when a shard owned rows but neither
+  # wrote nor found any cached (a fully-cached resume keeps n_exists>0 and is fine).
+  if n_owned and not n_written and not n_exists:
+    raise SystemExit(f"[precache-t2i] {n_owned} owned images but 0 caches written/found "
+                     f"({'no <name>.json -- run the caption builder on this --img-dir first' if args.prebuilt_json else 'all encodes skipped'})")
+  print(f"[precache-t2i] DONE: {len(imgs)} images -> {cache} "
+        f"(+{n_written} new, {n_exists} cached, shard {shard_id}/{num_shards})", flush=True)
 
 
 if __name__ == "__main__":

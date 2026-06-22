@@ -77,6 +77,16 @@ def main() -> None:
     ),
   )
   parser.add_argument(
+    "--weights",
+    default="",
+    help=(
+      "Load weights from this local directory or HF repo id instead of the "
+      "--quantization preset. Point it at a fine-tuned checkpoint produced by "
+      "export_fp8_checkpoint.py (a drop-in fp8 Ideogram-4 dir); a local dir is "
+      "served from disk. Overrides --quantization when set."
+    ),
+  )
+  parser.add_argument(
     "--magic-prompt",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -178,8 +188,15 @@ def main() -> None:
 
   preset = PRESETS[args.sampler_preset]
 
+  # --weights (a fine-tuned export dir or HF id) overrides the --quantization preset; a local
+  # directory is served from disk by monkeypatching the pipeline loader's hf_hub_download.
+  weights_repo = args.weights or QUANTIZATION_REPOS[args.quantization]
+  if os.path.isdir(weights_repo):
+    from ideogram4.training_config import patch_local_weights
+
+    patch_local_weights()
   pipe = Ideogram4Pipeline.from_pretrained(
-    config=Ideogram4PipelineConfig(weights_repo=QUANTIZATION_REPOS[args.quantization]),
+    config=Ideogram4PipelineConfig(weights_repo=weights_repo),
     device=args.device,
     dtype=torch.bfloat16,
   )

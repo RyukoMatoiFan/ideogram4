@@ -111,6 +111,10 @@ def main():
   val_every = int(getattr(cfg.logging, "val_every", 0))
   resume_from = cfg.paths.resume_from
   init_dit, init_te = cfg.paths.init_dit, cfg.paths.init_te
+  # The val block is nested inside the log_every gate, so val_every must be a multiple of log_every
+  # or it would silently never fire at the intended cadence.
+  if val_every and val_every % log_every:
+    raise SystemExit(f"[joint] val_every ({val_every}) must be a positive multiple of log_every ({log_every})")
 
   # Refuse to write run output under the home/root volume (it may be small or full on the host).
   if platform.system() == "Linux":
@@ -213,6 +217,9 @@ def main():
           if param.grad is None or not torch.isfinite(param.grad).all():
             param.grad = None; return  # never step inf/nan grads into weights (clip would nan them)
           if grad_clip:
+            # PER-PARAMETER norm clip (fused backward frees each grad before the next exists, so a
+            # global grad norm is impossible here). Effective global cap is ~grad_clip*sqrt(#tensors),
+            # looser than a single global clip; the non-finite-grad guard above is the real spike guard.
             torch.nn.utils.clip_grad_norm_(param, grad_clip)
           opt.step_parameter(param, g, idx)
           param.grad = None
@@ -252,6 +259,9 @@ def main():
   bucket_keys = list(bucket_files.keys())
   bucket_weights = [len(bucket_files[k]) for k in bucket_keys]
   print(f"[joint] {sum(bucket_weights)} training caches ({len(bucket_keys)} AR bucket(s))", flush=True)
+  if not bucket_keys:  # empty pool would otherwise raise inside the loop and burn 51 skips before abort
+    raise SystemExit(f"[joint] no training caches in {cache} with idx>={n_eval} -- run precache_t2i.py "
+                     f"first, or lower data.n_eval_holdout")
 
   gen = torch.Generator(device=device).manual_seed(int(cfg.runtime.seed))
   rng = random.Random(int(cfg.runtime.seed))
@@ -367,12 +377,25 @@ def main():
     mk = json.load(open(marker_path))
     if train_dit and mk.get("dit"):
       transformer.load_state_dict({k: v.to(device, dtype) for k, v in load_file(f"{ckpt}/{mk['dit']}").items()}, strict=True)
-    pipe.text_encoder.load_state_dict({k: v.to(device, dtype) for k, v in load_file(f"{ckpt}/{mk['te']}").items()}, strict=False)
+    rte = pipe.text_encoder.load_state_dict({k: v.to(device, dtype) for k, v in load_file(f"{ckpt}/{mk['te']}").items()}, strict=False)
+    print(f"[joint] resume TE ({len(rte.missing_keys)} miss, {len(rte.unexpected_keys)} unexp)", flush=True)
     start_step = int(mk["step"])
     for _ in range(start_step):
       sched_lr.step()
     rng.seed(int(cfg.runtime.seed) + start_step)
     gen.manual_seed(int(cfg.runtime.seed) + start_step)
+    # Prune metrics rows after the resumed step: the ckpt marker cadence (ckpt_every) is coarser than
+    # the metrics cadence (log_every), so a hard crash leaves post-marker rows the dashboard would
+    # otherwise re-draw, making the loss curve zigzag backward on each resume.
+    try:
+      if os.path.exists(metrics_path):
+        with open(metrics_path, encoding="utf-8") as mf:
+          kept = [ln for ln in mf if ln.strip() and json.loads(ln).get("step", 0) <= start_step]
+        with open(metrics_path + ".tmp", "w") as mf:
+          mf.writelines(kept)
+        os.replace(metrics_path + ".tmp", metrics_path)
+    except Exception as e:
+      print(f"[joint] WARN could not prune metrics on resume: {str(e)[:120]}", flush=True)
     print(f"[joint] RESUMED at step {start_step}", flush=True)
 
   # --- held-out deterministic val loss (fixed generator -> comparable across checkpoints) ---
@@ -387,6 +410,9 @@ def main():
     except Exception:
       pass
   print(f"[joint] {len(eval_items)} held-out eval caches", flush=True)
+  if eval_items and len(eval_items) < n_eval:
+    print(f"[joint] WARN only {len(eval_items)}/{n_eval} eval caches present -- some holdout idx "
+          f"missing (partial precache/sharding?); val loss is over a reduced set", flush=True)
 
   @torch.no_grad()
   def _val_loss():
@@ -420,7 +446,7 @@ def main():
       pass
 
   n_skipped = consec_skip = 0
-  run, t_last = 0.0, time.time()
+  run, n_ok, t_last = 0.0, 0, time.time()
   def _train_step():
     it = sample_item()
     return train_t2i.t2i_te_training_step(
@@ -467,11 +493,12 @@ def main():
         raise SystemExit("[joint] aborting: >50 consecutive non-finite/failed steps")
       continue
     consec_skip = 0
+    n_ok += 1
     sched_lr.step()
 
     if (step + 1) % log_every == 0:
       dt = (time.time() - t_last) / log_every
-      rec = {"step": step + 1, "loss": run / log_every, "lr": sched_lr.get_last_lr()[0],
+      rec = {"step": step + 1, "loss": run / max(1, n_ok), "lr": sched_lr.get_last_lr()[0],
              "te_lr": sched_lr.get_last_lr()[-1], "s_per_step": dt,
              "peak_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0.0,
              "skipped": n_skipped}
@@ -484,7 +511,7 @@ def main():
       with open(metrics_path, "a") as f:
         f.write(json.dumps(rec) + "\n")
       tracker.log(rec, rec["step"])
-      run, t_last = 0.0, time.time()
+      run, n_ok, t_last = 0.0, 0, time.time()
       if args.smoke and step + 1 >= 20:
         _sample(step + 1)  # smoke also exercises the preview encode/sample/decode path
         print("[joint] SMOKE OK", flush=True); return

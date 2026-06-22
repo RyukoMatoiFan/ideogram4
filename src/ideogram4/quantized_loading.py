@@ -25,12 +25,20 @@ FP8_SCALE_SUFFIX = ".weight_scale"
 FP8_TEXT_ENCODER_CONFIG_FLAG = "ideogram_fp8_weight_only"
 
 
+_E4M3_GRID_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
 def _e4m3_positive_grid(device: torch.device) -> torch.Tensor:
-  """Sorted finite non-negative magnitudes representable in e4m3 (float8_e4m3fn).
-  Used to round onto the EXACT grid for stochastic rounding."""
+  """Sorted finite non-negative magnitudes representable in e4m3 (float8_e4m3fn), CACHED per
+  device (a fixed 256-entry constant). Used to round onto the EXACT grid for stochastic rounding."""
+  cached = _E4M3_GRID_CACHE.get(device)
+  if cached is not None:
+    return cached
   codes = torch.arange(256, dtype=torch.uint8, device=device)
   vals = codes.view(FP8_WEIGHT_DTYPE).to(torch.float32)
-  return torch.unique(vals[torch.isfinite(vals)].abs())  # ascending, includes 0.0
+  grid = torch.unique(vals[torch.isfinite(vals)].abs())  # ascending, includes 0.0
+  _E4M3_GRID_CACHE[device] = grid
+  return grid
 
 
 def _stochastic_round_to_e4m3(q: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
@@ -84,7 +92,9 @@ def fake_quantize_fp8(
   with the same RTN. Apply only to layers that will be exported fp8 (same keep-list as export).
   """
   wq, scale = quantize_to_fp8(weight, stochastic=stochastic, generator=generator)
-  deq = (wq.to(torch.float32) * scale.unsqueeze(1)).to(weight.dtype)
+  # Dequant in the WEIGHT (compute) dtype to match Fp8Linear.forward exactly (the deploy loader does
+  # a bf16 multiply); an fp32 multiply here would differ by ~1 bf16 ULP and reopen a tiny QAT gap.
+  deq = wq.to(weight.dtype) * scale.to(weight.dtype).unsqueeze(1)
   return weight + (deq - weight).detach()  # STE: forward=quantized, grad flows to weight
 
 
@@ -103,7 +113,8 @@ class QATFp8Linear(nn.Module):
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     w = fake_quantize_fp8(self.weight, stochastic=self.stochastic)
-    return F.linear(x, w.to(x.dtype), self.bias)
+    bias = self.bias.to(x.dtype) if self.bias is not None else None  # mirror Fp8Linear (cast bias)
+    return F.linear(x, w.to(x.dtype), bias)
 
 
 def is_bnb4bit_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
